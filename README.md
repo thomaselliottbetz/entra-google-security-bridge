@@ -1,4 +1,4 @@
-# Hybrid Identity & Security Automation Suite
+# Entra ID & Google Workspace Security Bridge
 
 **Repository:** [thomaselliottbetz/entra-google-security-bridge](https://github.com/thomaselliottbetz/entra-google-security-bridge)
 
@@ -6,9 +6,9 @@
 
 ## Project Overview
 
-This suite provides an end-to-end framework for managing security and identity lifecycle across a hybrid enterprise environment. It bridges the gap between Entra ID (Primary IdP) and Google Workspace (Collaboration Layer), ensuring security policies and user placements remain synchronized in real-time.
+This repository bridges security operations and attribute synchronization between Microsoft Entra ID and Google Workspace. While SCIM handles initial user provisioning, these scripts address ongoing security monitoring and post-provisioning attribute sync needs.
 
-The project is organized into three functional domains that create an automated security response loop: Identity Governance (Entra ID), The SSO Bridge (Cross-Platform), and Collaboration Security (Google Workspace).
+The project is organized into three functional domains: Identity Governance (Entra ID), Post-Provisioning Sync (Cross-Platform), and Collaboration Security (Google Workspace).
 
 ### 1. Identity Governance (Entra ID)
 
@@ -18,15 +18,15 @@ The project is organized into three functional domains that create an automated 
 
 **Guest User Audit (Zero-Trust):** Flags stale or untrusted external identities (B2B users) that may need access review or revocation. Guest users are external identities invited to access organization resources, identified by the `userType` property set to "Guest" in Microsoft Graph API. The script categorizes guests by trust level (trusted vs untrusted domains) and activity status (based on last sign-in date) to help prioritize access reviews and removals for zero-trust compliance.
 
-**Licensing Requirement:** Note that `lastSignInDateTime` is an Entra ID P1/P2 (Premium) property; the script includes fallback logic for standard tenants.
+**Licensing Requirement:** Note that `lastSignInDateTime` is an Entra ID P1/P2 (Premium) property. The script handles cases where this property may be unavailable (e.g., standard tenants) by treating users without a last sign-in date as inactive.
 
 **Tech Stack:** msal, Microsoft Graph API, OData
 
-### 2. The SSO Bridge (Cross-Platform)
+### 2. Post-Provisioning Sync (Cross-Platform)
 
-**Automated Provisioning:** Uses Entra ID as the "Source of Truth" to drive Organizational Unit (OU) placement in Google Workspace. When a new engineer is hired, they are created in Entra ID first, then this function queries Entra ID to find users who need to be provisioned or moved in Google Workspace based on specific attributes (e.g., Department, officeLocation, or custom attributes). Uses OData filter syntax supported by Microsoft Graph API (e.g., `officeLocation eq 'Seattle'` or `department eq 'Engineering'`). The returned user data includes key attributes like userPrincipalName (email), displayName, officeLocation, department, and jobTitle that can be used by a separate provisioning script to synchronize the user's organizational unit, department, and other attributes.
+**Attribute-Based OU Sync:** Queries Entra ID to identify users whose attributes have changed (e.g., Department, officeLocation) and synchronizes their Organizational Unit placement in Google Workspace. Assumes users already exist in Google Workspace (provisioned via SCIM or other means). Uses OData filter syntax supported by Microsoft Graph API (e.g., `officeLocation eq 'Seattle'` or `department eq 'Engineering'`) to find users needing OU updates. The returned user data includes key attributes like userPrincipalName (email), displayName, officeLocation, department, and jobTitle that can be used to update the user's organizational unit placement in Google Workspace.
 
-**OAuth 2.0 Implementation:** Includes both "Elliptical" implementations using raw `v2.0/token` requests with the `.default` scope to illustrate the essential Client Credentials Grant flow, and full implementations using MSAL for production use.
+**OAuth 2.0 Implementation:** Uses MSAL (Microsoft Authentication Library) for OAuth 2.0 client credentials flow with automatic token management.
 
 **Tech Stack:** OAuth 2.0, Service Accounts, Domain-Wide Delegation
 
@@ -40,10 +40,10 @@ The project is organized into three functional domains that create an automated 
 
 ## File Structure
 
-- `identity_governance_ms.py` - Identity governance scripts for Microsoft ecosystem (risky sign-ins, guest user audit, SSO bridge source)
+- `identity_governance_ms.py` - Identity governance scripts for Microsoft ecosystem (risky sign-ins, guest user audit, post-provisioning sync source)
 - `collaboration_security_google.py` - Collaboration security scripts for Google Workspace (OU management, OAuth token audit)
 
-Each file contains both "Elliptical" versions (concise implementations) and "Full" versions (production-ready with complete error handling).
+All functions include complete error handling and logging suitable for production use.
 
 ## Requirements
 
@@ -67,6 +67,7 @@ requests>=2.31.0
 - Service account with domain-wide delegation enabled
 - Service account JSON key file
 - Admin user email for impersonation (set via `GOOGLE_ADMIN_EMAIL` environment variable)
+- **Note:** `GOOGLE_ADMIN_EMAIL` is required and validated at runtime. If not set, functions will raise a `ValueError` with a clear error message.
 
 ### Required API Permissions
 
@@ -108,6 +109,10 @@ guest_report = audit_guest_users(
     trusted_domains=["bigenterprise.com", "partner-company.com"],
     days_inactive=90
 )
+
+# Returns a dictionary with keys: 'trusted_active', 'trusted_inactive', 
+# 'untrusted_active', 'untrusted_inactive'
+print(f"Untrusted inactive guests: {len(guest_report.get('untrusted_inactive', []))}")
 ```
 
 ### Move User to Different OU
@@ -133,7 +138,7 @@ from collaboration_security_google import audit_oauth_tokens
 
 os.environ['GOOGLE_ADMIN_EMAIL'] = 'admin@bigenterprise.com'
 
-audit_oauth_tokens(
+token_report = audit_oauth_tokens(
     credentials_path="/path/to/service_account.json",
     blocked_scopes=[
         'https://www.googleapis.com/auth/drive',
@@ -141,14 +146,17 @@ audit_oauth_tokens(
     ],
     approved_apps=['Google Workspace', 'Slack', 'Microsoft']
 )
+
+# Returns a dictionary with keys: 'high_risk', 'medium_risk', 'low_risk'
+print(f"High-risk tokens found: {len(token_report.get('high_risk', []))}")
 ```
 
-### SSO Bridge: Query Entra ID for Provisioning
+### Post-Provisioning Sync: Query Entra ID for OU Updates
 
 ```python
 from identity_governance_ms import get_entra_users_with_changes
 
-users_to_provision = get_entra_users_with_changes(
+users_needing_sync = get_entra_users_with_changes(
     tenant_id="your-tenant-id",
     client_id="your-app-client-id",
     client_secret="your-client-secret",
@@ -156,13 +164,46 @@ users_to_provision = get_entra_users_with_changes(
 )
 ```
 
+### Sync Entra ID to Google Workspace OUs
+
+```python
+import os
+from collaboration_security_google import sync_entra_to_google_ou
+
+os.environ['GOOGLE_ADMIN_EMAIL'] = 'admin@bigenterprise.com'
+
+result = sync_entra_to_google_ou(
+    entra_tenant_id="your-tenant-id",
+    entra_client_id="your-app-client-id",
+    entra_client_secret="your-client-secret",
+    google_credentials_path="/path/to/service_account.json",
+    ou_mapping={
+        "officeLocation": {
+            "Seattle": "/Engineering/Seattle",
+            "NYC": "/Engineering/NYC"
+        }
+    },
+    filter_criteria="officeLocation eq 'Seattle' or officeLocation eq 'NYC'",
+    email_domain_mapping={"@company.com": "@company.google.com"}  # Optional if domains differ
+)
+
+# Returns a dictionary with keys: 'synced', 'skipped', 'failed'
+print(f"Synced: {len(result['synced'])} users")
+print(f"Skipped (not in Google): {len(result['skipped'])} users")
+print(f"Failed: {len(result['failed'])} users")
+
+# Access details of synced users
+for user in result['synced']:
+    print(f"{user['email']} moved from {user['previous_ou']} to {user['target_ou']}")
+```
+
 ## Production-Ready Considerations
 
-This suite incorporates infrastructure patterns required for enterprise-scale deployment:
+These scripts incorporate infrastructure patterns suitable for enterprise deployment:
 
 **API Resilience:** Built-in handling for `@odata.nextLink` (Microsoft) and `nextPageToken` (Google) to support environments with 10,000+ users. All user queries handle pagination automatically.
 
-**Idempotency & Pre-flight Checks:** Full implementations verify the current state (e.g., current OU) before applying changes to prevent "blind updates" and unnecessary API overhead. This helps catch cases where the user might already be in a different OU than expected, which could indicate a data inconsistency or that the move was already performed.
+**Idempotency & Pre-flight Checks:** Functions verify the current state (e.g., current OU) before applying changes to prevent "blind updates" and unnecessary API overhead. This helps catch cases where the user might already be in a different OU than expected, which could indicate a data inconsistency or that the move was already performed.
 
 **Principle of Least Privilege:** Scripts use granular scopes (e.g., `admin.directory.user.security`) rather than global Super Admin rights. Each function requests only the minimum permissions required.
 
@@ -183,11 +224,11 @@ Scripts can be run as:
 
 ## Why This Approach Matters
 
-**Defense-in-Depth:** We don't just detect risk; we automate the mitigation (moving OUs) and the forensics (auditing tokens). The SSO bridge ensures identity changes in Entra ID are automatically reflected in Google Workspace.
+**Security Monitoring:** These scripts provide programmatic access to security events (risky sign-ins, guest audits, OAuth token audits) that can be integrated into security workflows and monitoring systems.
 
-**Efficiency:** By handling complex filtering in Python rather than OData lambda operators, we ensure the highest performance during high-traffic security events. Pagination handling ensures complete coverage even in large organizations.
+**Post-Provisioning Sync:** While SCIM handles initial user provisioning, these scripts bridge the gap for ongoing attribute synchronization, particularly for organizational unit placement based on changing user attributes.
 
-**Portability:** Using tenant-agnostic patterns and environment-based configuration ensures the code works across different tenants and regions without modification.
+**Operational Efficiency:** By handling complex filtering in Python rather than OData lambda operators, we ensure optimal performance during high-traffic security events. Pagination handling ensures complete coverage even in large organizations.
 
 ## Note on OAuth Scopes
 

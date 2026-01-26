@@ -1,148 +1,69 @@
-# Security operations automation
-# ============================================================================
-# Google Workspace security scripts using Admin SDK API
-# ELLIPTICAL VERSIONS - Essential implementations
-# ============================================================================
 import logging
 import os
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from identity_governance_ms import get_entra_users_with_changes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def _get_admin_email():
+    """
+    Gets and validates GOOGLE_ADMIN_EMAIL environment variable.
+    
+    Returns:
+        Admin email address string
+    
+    Raises:
+        ValueError: If GOOGLE_ADMIN_EMAIL is not set
+    """
+    admin_email = os.environ.get('GOOGLE_ADMIN_EMAIL')
+    if not admin_email:
+        raise ValueError("GOOGLE_ADMIN_EMAIL environment variable must be set")
+    return admin_email
+
 def move_user_to_ou(user_email, target_ou_path, credentials_path):
     """
-    Moves a user to a different organizational unit (OU) in Google Workspace. Organizational
-    units structure the organization's hierarchy and can apply different policies to different
-    groups of users. Uses service account credentials with domain-wide delegation enabled,
-    which allows the service account to act on behalf of users in the domain. We impersonate
-    an admin user via with_subject() method using the GOOGLE_ADMIN_EMAIL environment variable,
-    then use Admin SDK Directory API to update the user's orgUnitPath property. This is useful
-    for reorganizing users as they change roles or departments. Suitable for scheduled execution,
-    manual runs during user onboarding/offboarding, or integration into HR workflow automation.
+    Moves a user to a different organizational unit in Google Workspace.
+    
+    Updates the user's orgUnitPath property using Google Admin SDK Directory API.
+    Requires service account with domain-wide delegation and GOOGLE_ADMIN_EMAIL environment variable.
+    
+    Args:
+        user_email: User's primary email address
+        target_ou_path: Target organizational unit path (e.g., "/Engineering/Seattle")
+        credentials_path: Path to service account JSON key file
     """
+    scopes = ['https://www.googleapis.com/auth/admin.directory.user']
+    credentials = service_account.Credentials.from_service_account_file(
+        credentials_path, scopes=scopes)
     
-    # Service account setup (assumes domain-wide delegation configured)
-    creds = service_account.Credentials.from_service_account_file(
-        credentials_path,
-        scopes=['https://www.googleapis.com/auth/admin.directory.user']
-    )
-    delegated = creds.with_subject(os.environ.get('GOOGLE_ADMIN_EMAIL'))
+    delegated_credentials = credentials.with_subject(_get_admin_email())
+    service = build('admin', 'directory_v1', credentials=delegated_credentials)
     
-    service = build('admin', 'directory_v1', credentials=delegated)
-    service.users().update(
-        userKey=user_email,
-        body={"orgUnitPath": target_ou_path}
-    ).execute()
-    
-    logger.info(f"Moved {user_email} to {target_ou_path}")
-
-def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None):
-    """
-    Audit third-party OAuth apps users have authorized to access Google Workspace data. Users
-    often grant permissions without fully understanding what access they're providing, creating
-    "shadow IT" - unauthorized third-party applications with access to corporate data. This
-    uses Google Admin SDK with broader permissions (admin.directory.user.readonly and
-    admin.directory.user.security scopes) to query the tokens() API endpoint for all users.
-    Handles pagination to retrieve all users in large organizations. Each token represents
-    an authorized application and includes what permissions (scopes) it has been granted.
-    Checks tokens against blocked_scopes list and approved_apps whitelist, flags high-risk
-    apps (blocked scopes + not approved) to help reduce attack surface. Run as a scheduled
-    audit, on-demand, or integrated into a monitoring system.
-    """
-    
-    # Broader scopes needed for token access
-    creds = service_account.Credentials.from_service_account_file(
-        credentials_path,
-        scopes=[
-            'https://www.googleapis.com/auth/admin.directory.user.readonly',
-            'https://www.googleapis.com/auth/admin.directory.user.security'
-        ]
-    )
-    delegated = creds.with_subject(os.environ.get('GOOGLE_ADMIN_EMAIL'))
-    service = build('admin', 'directory_v1', credentials=delegated)
-    
-    blocked_scopes = blocked_scopes or ['https://www.googleapis.com/auth/drive']
-    approved_apps = approved_apps or []
-    
-    # Get all users and their tokens (handle pagination)
-    users = []
-    page_token = None
-    while True:
-        if page_token:
-            result = service.users().list(customer='my_customer', maxResults=500, pageToken=page_token).execute()
-        else:
-            result = service.users().list(customer='my_customer', maxResults=500).execute()
-        users.extend(result.get('users', []))
-        page_token = result.get('nextPageToken')
-        if not page_token:
-            break
-    
-    high_risk = []
-    
-    for user in users:
-        email = user.get('primaryEmail')
-        if not email:
-            continue
-        try:
-            tokens = service.tokens().list(userKey=email).execute().get('items', [])
-            for token in tokens:
-                app_name = token.get('displayText', 'Unknown')
-                scopes = token.get('scopes', [])
-                has_blocked = any(s in blocked_scopes for s in scopes)
-                is_approved = any(a.lower() in app_name.lower() for a in approved_apps)
-                
-                if has_blocked and not is_approved:
-                    high_risk.append({'user': email, 'app': app_name, 'scopes': scopes})
-        except Exception:
-            # User may not have tokens or we may lack permission - skip
-            continue
-    
-    # Report findings
-    for item in high_risk:
-        logger.warning(f"HIGH RISK FOUND: {item['user']} | {item['app']} | {item['scopes']}")
-    
-    return high_risk
-
-# ============================================================================
-# FULL IMPLEMENTATIONS - Detailed versions with complete error handling
-# ============================================================================
-
-import os
-
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+    try:
+        body = {"orgUnitPath": target_ou_path}
+        service.users().update(userKey=user_email, body=body).execute()
+        logger.info(f"User {user_email} moved to {target_ou_path}")
+    except Exception as e:
+        logger.error(f"Error moving user: {e}")
+        raise
 
 def move_user_between_ous(user_email, source_org_unit_path, target_org_unit_path, credentials_path):
     """
-    Moves users between organizational units (OUs) in Google Workspace, which is useful for
-    reorganizing users as they change roles or departments. Organizational units help structure
-    the organization's hierarchy and can be used to apply different policies to different
-    groups of users.
+    Moves a user between organizational units in Google Workspace with pre-flight verification.
     
-    The function starts by loading service account credentials from a JSON file specified by
-    credentials_path. These credentials need to have domain-wide delegation enabled, which
-    allows the service account to act on behalf of users in the domain. We request the
-    admin.directory.user scope, which gives us permission to read and update user information.
+    Verifies the user's current OU matches the expected source OU before moving to target OU.
+    Logs a warning if current OU differs from expected source.
     
-    Since we're using a service account, we need to impersonate an admin user to perform the
-    operation. This is done using the with_subject() method, which takes the admin email from
-    the GOOGLE_ADMIN_EMAIL environment variable. The delegated_credentials object now has the
-    authority to act as that admin user.
+    Args:
+        user_email: User's primary email address
+        source_org_unit_path: Expected current OU path (for verification)
+        target_org_unit_path: Target OU path
+        credentials_path: Path to service account JSON key file
     
-    We then build the Admin SDK Directory API service using discovery.build(). Before making
-    the change, we optionally verify the user's current OU by calling users().get() to fetch
-    the user's current information. This helps catch cases where the user might already be in
-    a different OU than expected, which could indicate a data inconsistency or that the move
-    was already performed.
-    
-    To move the user, we create an update_body dictionary with the new orgUnitPath and call
-    users().update() with the user's email as the userKey. The API updates the user's
-    organizational unit, which can affect what policies and settings apply to that user. This
-    is particularly important in security contexts where different OUs might have different
-    security requirements or access controls.
+    Note: Requires service account with domain-wide delegation and GOOGLE_ADMIN_EMAIL environment variable.
     """
     # Create credentials
     scopes = ['https://www.googleapis.com/auth/admin.directory.user']
@@ -150,7 +71,7 @@ def move_user_between_ous(user_email, source_org_unit_path, target_org_unit_path
         credentials_path, scopes=scopes)
     
     # Needs domain-wide delegation - use admin user for impersonation
-    delegated_credentials = credentials.with_subject(os.environ.get('GOOGLE_ADMIN_EMAIL'))
+    delegated_credentials = credentials.with_subject(_get_admin_email())
 
     service = build('admin', 'directory_v1', credentials=delegated_credentials)
     try:
@@ -168,16 +89,7 @@ def move_user_between_ous(user_email, source_org_unit_path, target_org_unit_path
     except Exception as e:
         logger.error(f"Error moving user: {e}")
 
-# Example usage (variables should be set accordingly)
-# os.environ['GOOGLE_ADMIN_EMAIL'] = 'admin@yourdomain.com'
-# move_user_between_ous(
-#     user_email="user@example.com",
-#     source_org_unit_path="/OldOrgUnit",
-#     target_org_unit_path="/NewOrgUnit",
-#     credentials_path="/path/to/service_account.json"
-# )
-
-def audit_oauth_tokens_full(credentials_path, blocked_scopes=None, approved_apps=None):
+def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None):
     """
     Audits third-party applications that users have authorized to access their Google Workspace
     data through OAuth tokens. Users sometimes grant permissions without fully understanding
@@ -220,7 +132,7 @@ def audit_oauth_tokens_full(credentials_path, blocked_scopes=None, approved_apps
         credentials_path, scopes=scopes)
     
     # Use admin user for impersonation
-    delegated_credentials = credentials.with_subject(os.environ.get('GOOGLE_ADMIN_EMAIL'))
+    delegated_credentials = credentials.with_subject(_get_admin_email())
     service = build('admin', 'directory_v1', credentials=delegated_credentials)
     
     if blocked_scopes is None:
@@ -340,14 +252,150 @@ def audit_oauth_tokens_full(credentials_path, blocked_scopes=None, approved_apps
         logger.error(f"Error auditing OAuth tokens: {e}")
         return {}
 
-# Example usage for big-enterprise
-# os.environ['GOOGLE_ADMIN_EMAIL'] = 'admin@bigenterprise.com'
-# audit_oauth_tokens(
-#     credentials_path="/path/to/service_account.json",
-#     blocked_scopes=[
-#         'https://www.googleapis.com/auth/drive',
-#         'https://www.googleapis.com/auth/gmail.send'
-#     ],
-#     approved_apps=['Google Workspace', 'Slack', 'Microsoft']
-# )
-
+def sync_entra_to_google_ou(
+    entra_tenant_id,
+    entra_client_id,
+    entra_client_secret,
+    google_credentials_path,
+    ou_mapping=None,
+    filter_criteria=None,
+    email_domain_mapping=None
+):
+    """
+    Syncs organizational unit placement from Entra ID to Google Workspace with detailed error handling.
+    
+    Queries Entra ID for users matching filter criteria, maps attributes to OU paths, and
+    updates Google Workspace users. Verifies user existence, checks current OU, and provides
+    detailed logging and error reporting.
+    
+    Args:
+        entra_tenant_id: Entra ID tenant ID
+        entra_client_id: Entra ID app client ID
+        entra_client_secret: Entra ID app client secret
+        google_credentials_path: Path to Google service account JSON
+        ou_mapping: Dict mapping Entra attributes to OU paths, e.g.:
+                   {"officeLocation": {"Seattle": "/Engineering/Seattle", "NYC": "/Engineering/NYC"}}
+                   or {"department": {"Engineering": "/Engineering"}}
+        filter_criteria: OData filter for Entra ID query (optional)
+        email_domain_mapping: Optional dict mapping Entra email domains to Google domains,
+                             e.g., {"@company.com": "@company.google.com"}
+    
+    Returns:
+        Dictionary with keys 'synced', 'skipped', 'failed'. 'synced' contains dictionaries with
+        email, source_attr, source_value, target_ou, previous_ou. 'skipped' and 'failed' contain
+        email lists and error details respectively.
+    """
+    if ou_mapping is None:
+        ou_mapping = {
+            "officeLocation": {
+                "Seattle": "/Engineering/Seattle",
+                "NYC": "/Engineering/NYC"
+            }
+        }
+    
+    # Get users from Entra ID
+    entra_users = get_entra_users_with_changes(
+        tenant_id=entra_tenant_id,
+        client_id=entra_client_id,
+        client_secret=entra_client_secret,
+        filter_criteria=filter_criteria
+    )
+    
+    if not entra_users:
+        logger.info("No users found in Entra ID matching criteria")
+        return []
+    
+    # Setup Google service for checking user existence
+    creds = service_account.Credentials.from_service_account_file(
+        google_credentials_path,
+        scopes=['https://www.googleapis.com/auth/admin.directory.user']
+    )
+    delegated = creds.with_subject(_get_admin_email())
+    service = build('admin', 'directory_v1', credentials=delegated)
+    
+    synced_users = []
+    skipped_users = []
+    failed_users = []
+    
+    logger.info(f"Processing {len(entra_users)} users from Entra ID for OU sync")
+    
+    for user in entra_users:
+        email = user.get('userPrincipalName')
+        if not email:
+            logger.debug(f"Skipping user with no userPrincipalName: {user}")
+            continue
+        
+        # Transform email if domain mapping provided
+        google_email = email
+        if email_domain_mapping:
+            for entra_domain, google_domain in email_domain_mapping.items():
+                if email.endswith(entra_domain):
+                    google_email = email.replace(entra_domain, google_domain)
+                    break
+        
+        # Check if user exists in Google Workspace
+        try:
+            google_user = service.users().get(userKey=google_email).execute()
+            current_ou = google_user.get('orgUnitPath', '/')
+        except Exception as e:
+            logger.debug(f"User {google_email} not found in Google Workspace, skipping: {e}")
+            skipped_users.append(google_email)
+            continue
+        
+        # Determine target OU based on mapping
+        target_ou = None
+        matched_attr = None
+        matched_value = None
+        
+        for attr_name, value_map in ou_mapping.items():
+            user_value = user.get(attr_name, '')
+            if user_value and user_value in value_map:
+                target_ou = value_map[user_value]
+                matched_attr = attr_name
+                matched_value = user_value
+                break
+        
+        if not target_ou:
+            logger.debug(f"No OU mapping found for {email} (attributes: {user})")
+            continue
+        
+        # Skip if already in target OU
+        if current_ou == target_ou:
+            logger.debug(f"User {email} already in target OU {target_ou}, skipping")
+            continue
+        
+        # Move user to target OU
+        try:
+            move_user_to_ou(
+                user_email=google_email,
+                target_ou_path=target_ou,
+                credentials_path=google_credentials_path
+            )
+            synced_users.append({
+                'email': google_email,
+                'source_attr': matched_attr,
+                'source_value': matched_value,
+                'target_ou': target_ou,
+                'previous_ou': current_ou
+            })
+            logger.info(f"Synced {google_email} from {current_ou} to {target_ou} (matched on {matched_attr}={matched_value})")
+        except Exception as e:
+            logger.error(f"Failed to sync {google_email} to {target_ou}: {e}")
+            failed_users.append({'email': google_email, 'target_ou': target_ou, 'error': str(e)})
+    
+    # Summary logging
+    logger.info(f"Sync complete: {len(synced_users)} synced, {len(skipped_users)} skipped (not in Google), {len(failed_users)} failed")
+    
+    if skipped_users:
+        logger.info(f"Skipped users (not found in Google Workspace): {len(skipped_users)}")
+    
+    if failed_users:
+        logger.warning(f"Failed to sync {len(failed_users)} users")
+        for failed in failed_users:
+            logger.warning(f"  {failed['email']} -> {failed['target_ou']}: {failed['error']}")
+    
+    return {
+        'synced': synced_users,
+        'skipped': skipped_users,
+        'failed': failed_users
+    }
