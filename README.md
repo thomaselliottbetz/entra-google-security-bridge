@@ -67,7 +67,7 @@ requests>=2.31.0
 - Service account with domain-wide delegation enabled
 - Service account JSON key file
 - Admin user email for impersonation (set via `GOOGLE_ADMIN_EMAIL` environment variable)
-- **Note:** `GOOGLE_ADMIN_EMAIL` is required and validated at runtime. If not set, functions will raise a `ValueError` with a clear error message.
+- **Note:** `GOOGLE_ADMIN_EMAIL` is required and validated at runtime. If not set, functions will raise a `ValueError`.
 
 ### Required API Permissions
 
@@ -125,7 +125,7 @@ os.environ['GOOGLE_ADMIN_EMAIL'] = 'admin@bigenterprise.com'
 
 move_user_to_ou(
     user_email="engineer@bigenterprise.com",
-    target_ou_path="/Engineering/Arene_Project",
+    target_ou_path="/Engineering/ProjectA",
     credentials_path="/path/to/service_account.json"
 )
 ```
