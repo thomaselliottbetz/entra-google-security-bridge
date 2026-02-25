@@ -1,53 +1,117 @@
 # Entra ID & Google Workspace Security Bridge
 
 **Repository:** [thomaselliottbetz/entra-google-security-bridge](https://github.com/thomaselliottbetz/entra-google-security-bridge)
-
 **Target Environment:** Microsoft Entra ID + Google Workspace (Hybrid Identity)
 
-## Project Overview
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Functional Domains](#functional-domains)
+- [File Structure](#file-structure)
+- [Requirements](#requirements)
+- [Authentication Setup](#authentication-setup)
+- [Required API Permissions](#required-api-permissions)
+- [Usage Examples](#usage-examples)
+- [Production-Ready Considerations](#production-ready-considerations)
+- [Deployment Options](#deployment-options)
+- [Limitations](#limitations)
+
+---
+
+## Overview
 
 This repository bridges security operations and attribute synchronization between Microsoft Entra ID and Google Workspace. While SCIM handles initial user provisioning, these scripts address ongoing security monitoring and post-provisioning attribute sync needs.
 
 The project is organized into three functional domains: Identity Governance (Entra ID), Post-Provisioning Sync (Cross-Platform), and Collaboration Security (Google Workspace).
 
+---
+
+## Architecture
+
+```
+Entra ID (Microsoft Graph API)          Google Workspace (Admin SDK)
+         │                                        │
+         │  OAuth 2.0 client credentials          │  Service account +
+         │                                        │  domain-wide delegation
+         ▼                                        ▼
+┌─────────────────────┐              ┌────────────────────────────┐
+│ identity_governance │  ──────────▶ │ collaboration_security_    │
+│ _ms.py              │  user attrs  │ google.py                  │
+│                     │              │                            │
+│ • Risky sign-ins    │              │ • OU sync                  │
+│ • Guest user audit  │              │ • OAuth token audit        │
+│ • User attr query   │              │ • OU management            │
+└─────────────────────┘              └────────────────────────────┘
+         │                                        │
+         └──────────── SIEM / SOAR ───────────────┘
+              (Splunk, Sentinel, Google SecOps)
+```
+
+---
+
+## Functional Domains
+
 ### 1. Identity Governance (Entra ID)
 
-**Risky Sign-In Monitoring:** Programmatically detects suspicious sign-in patterns including "Impossible Travel" and "Anonymous IP" alerts from Microsoft's Identity Protection service. Microsoft's backend continuously analyzes sign-in patterns and flags suspicious activity, and this endpoint lets us query those flagged events programmatically to build our own security monitoring and alerting. Reports include user email, risk level (low/medium/high), IP address, geographic location (city, country), and specific risk event types that triggered the alert (like "anonymousIP" for VPN/Tor usage or "unfamiliarLocation" for sign-ins from new places).
+**Risky Sign-In Monitoring**
 
-**Performance Note:** Optimized via OData filtering on indexed `createdDateTime` fields to avoid API latency and 429 throttling. The query filters by time window only, since all results from the `riskySignIns` endpoint already have risk events associated. Results are filtered by risk level threshold in Python for optimal performance.
+Detects suspicious sign-in patterns by querying Microsoft Identity Protection. Results include user email, risk level (low/medium/high), IP address, geographic location, and the specific risk event types that triggered the alert — for example, `anonymousIP` for VPN/Tor usage or `unfamiliarFeatures` for sign-ins from new locations.
 
-**Guest User Audit (Zero-Trust):** Flags stale or untrusted external identities (B2B users) that may need access review or revocation. Guest users are external identities invited to access organization resources, identified by the `userType` property set to "Guest" in Microsoft Graph API. The script categorizes guests by trust level (trusted vs untrusted domains) and activity status (based on last sign-in date) to help prioritize access reviews and removals for zero-trust compliance.
+Risk level filtering is applied in Python after retrieval rather than via OData lambda operators. The time-window filter uses indexed `createdDateTime` fields to minimize API latency and avoid 429 throttling. Full pagination via `@odata.nextLink` ensures no events are missed.
 
-**Licensing Requirement:** Note that `lastSignInDateTime` is an Entra ID P1/P2 (Premium) property. The script handles cases where this property may be unavailable (e.g., standard tenants) by treating users without a last sign-in date as inactive.
+**Guest User Audit (Zero-Trust)**
 
-**Tech Stack:** msal, Microsoft Graph API, OData
+Flags stale or untrusted external identities (B2B users) for access review or revocation. Guest users are identified by `userType eq 'Guest'` in Microsoft Graph and categorized by trust level (trusted vs. untrusted domains) and activity status (based on `lastSignInDateTime`), making it straightforward to prioritize removals for zero-trust compliance.
+
+Note: `lastSignInDateTime` requires an Entra ID P1/P2 license. Users without a recorded sign-in date are treated as inactive.
+
+**Tech Stack:** MSAL, Microsoft Graph API, OData
+
+---
 
 ### 2. Post-Provisioning Sync (Cross-Platform)
 
-**Attribute-Based OU Sync:** Queries Entra ID to identify users whose attributes have changed (e.g., Department, officeLocation) and synchronizes their Organizational Unit placement in Google Workspace. Assumes users already exist in Google Workspace (provisioned via SCIM or other means). Uses OData filter syntax supported by Microsoft Graph API (e.g., `officeLocation eq 'Seattle'` or `department eq 'Engineering'`) to find users needing OU updates. The returned user data includes key attributes like userPrincipalName (email), displayName, officeLocation, department, and jobTitle that can be used to update the user's organizational unit placement in Google Workspace.
+**Attribute-Based OU Sync**
 
-**OAuth 2.0 Implementation:** Uses MSAL (Microsoft Authentication Library) for OAuth 2.0 client credentials flow with automatic token management.
+Queries Entra ID for users whose attributes (e.g., `department`, `officeLocation`) match a given OData filter, then synchronizes their Organizational Unit placement in Google Workspace. Assumes users already exist in Google Workspace, provisioned via SCIM or other means.
+
+Authentication uses MSAL's OAuth 2.0 client credentials flow with automatic token management. The returned user data — `userPrincipalName`, `displayName`, `officeLocation`, `department`, `jobTitle` — drives the OU mapping logic on the Google side.
 
 **Tech Stack:** OAuth 2.0, Service Accounts, Domain-Wide Delegation
 
+---
+
 ### 3. Collaboration Security (Google Workspace)
 
-**OU Management:** Tools for rapid user relocation during role changes or incident response scenarios. Organizational units structure the organization's hierarchy and can apply different policies to different groups of users. Useful for reorganizing users as they change roles or departments. Suitable for scheduled execution, manual runs during user onboarding/offboarding, or integration into HR workflow automation.
+**OU Management**
 
-**Shadow IT Audit:** Scans for high-risk OAuth tokens (e.g., `drive.readonly`, `gmail.send`) and flags apps not on the approved whitelist. Addresses the  "shadow IT" problem where users grant permissions without fully understanding the scope of access, allowing unauthorized third-party applications to gain access to corporate data. Each token represents an authorized application and includes what permissions (scopes) it has been granted, as well as whether it's an anonymous application. The output categorizes tokens into different risk levels: high-risk (blocked scopes, not approved), medium-risk (sensitive scopes but from unknown apps), and low-risk (approved apps or safe scopes). This helps prioritize which OAuth authorizations need immediate review or revocation. Handles pagination to support organizations with thousands of users.
+Provides tools for user relocation during role changes or incident response. Includes a simple move function (`move_user_to_ou`) and a pre-flight variant (`move_user_between_ous`) that verifies the user's current OU matches the expected source before proceeding. Suitable for scheduled execution, manual incident response, or HR workflow automation.
+
+**Shadow IT / OAuth Token Audit**
+
+Scans all users for high-risk OAuth grants (e.g., `drive.readonly`, `gmail.send`) and flags applications not on the approved allowlist. Each token record includes the application name, granted scopes, and whether the application is anonymous. Results are categorized into high-risk (blocked scopes, not approved), medium-risk (sensitive scopes from unknown apps), and low-risk (approved apps or safe scopes). Full pagination handles organizations with thousands of users.
 
 **Tech Stack:** Google Admin SDK, Google Auth Library
 
+---
+
 ## File Structure
 
-- `identity_governance_ms.py` - Identity governance scripts for Microsoft ecosystem (risky sign-ins, guest user audit, post-provisioning sync source)
-- `collaboration_security_google.py` - Collaboration security scripts for Google Workspace (OU management, OAuth token audit)
+| File | Description |
+|------|-------------|
+| `identity_governance_ms.py` | Risky sign-in monitoring, guest user audit, and Entra ID attribute query for post-provisioning sync |
+| `collaboration_security_google.py` | Google Workspace OU management (`move_user_to_ou`, `move_user_between_ous`), OAuth token audit, and cross-platform OU sync |
 
-All functions include complete error handling and logging suitable for production use.
+---
 
 ## Requirements
 
-### Python Dependencies
+### Python
+
+Python 3.9 or later.
+
+### Dependencies
 
 ```
 msal>=1.24.0
@@ -56,30 +120,50 @@ google-api-python-client>=2.100.0
 requests>=2.31.0
 ```
 
-### Authentication Setup
+Install with:
 
-**Entra ID:**
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## Authentication Setup
+
+**Entra ID**
 - App registration in Azure AD with appropriate API permissions
-- Client ID and Client Secret
-- Tenant ID
+- Client ID, Client Secret, and Tenant ID
 
-**Google Workspace:**
+**Google Workspace**
 - Service account with domain-wide delegation enabled
 - Service account JSON key file
-- Admin user email for impersonation (set via `GOOGLE_ADMIN_EMAIL` environment variable)
-- **Note:** `GOOGLE_ADMIN_EMAIL` is required and validated at runtime. If not set, functions will raise a `ValueError`.
+- Admin user email for impersonation — set via the `GOOGLE_ADMIN_EMAIL` environment variable
 
-### Required API Permissions
+> **Note:** `GOOGLE_ADMIN_EMAIL` is required and validated at runtime. Functions raise a `ValueError` if it is not set.
 
-**Microsoft Graph:**
-- `IdentityRiskEvent.Read.All` (for risky sign-ins)
-- `User.Read.All` (for user queries)
-- `Directory.Read.All` (for guest user audit)
+---
 
-**Google Workspace:**
-- `admin.directory.user` (for OU management)
-- `admin.directory.user.readonly` (for user listing)
-- `admin.directory.user.security` (for OAuth token access - requires explicit admin approval)
+## Required API Permissions
+
+### Microsoft Graph
+
+| Permission | Purpose |
+|---|---|
+| `IdentityRiskEvent.Read.All` | Risky sign-in monitoring |
+| `User.Read.All` | User attribute queries |
+| `Directory.Read.All` | Guest user audit |
+
+All permissions require application-level grants with admin consent.
+
+### Google Workspace
+
+| Scope | Purpose |
+|---|---|
+| `admin.directory.user` | OU management (read/write) |
+| `admin.directory.user.readonly` | User listing for OAuth token audit |
+| `admin.directory.user.security` | OAuth token access — requires explicit approval in the Google Workspace admin console |
+
+---
 
 ## Usage Examples
 
@@ -110,7 +194,7 @@ guest_report = audit_guest_users(
     days_inactive=90
 )
 
-# Returns a dictionary with keys: 'trusted_active', 'trusted_inactive', 
+# Returns a dictionary with keys: 'trusted_active', 'trusted_inactive',
 # 'untrusted_active', 'untrusted_inactive'
 print(f"Untrusted inactive guests: {len(guest_report.get('untrusted_inactive', []))}")
 ```
@@ -126,6 +210,22 @@ os.environ['GOOGLE_ADMIN_EMAIL'] = 'admin@bigenterprise.com'
 move_user_to_ou(
     user_email="engineer@bigenterprise.com",
     target_ou_path="/Engineering/ProjectA",
+    credentials_path="/path/to/service_account.json"
+)
+```
+
+### Move User with Pre-Flight Verification
+
+```python
+import os
+from collaboration_security_google import move_user_between_ous
+
+os.environ['GOOGLE_ADMIN_EMAIL'] = 'admin@bigenterprise.com'
+
+move_user_between_ous(
+    user_email="engineer@bigenterprise.com",
+    source_org_unit_path="/Engineering",
+    target_org_unit_path="/Engineering/ProjectA",
     credentials_path="/path/to/service_account.json"
 )
 ```
@@ -151,7 +251,7 @@ token_report = audit_oauth_tokens(
 print(f"High-risk tokens found: {len(token_report.get('high_risk', []))}")
 ```
 
-### Post-Provisioning Sync: Query Entra ID for OU Updates
+### Query Entra ID for OU Updates
 
 ```python
 from identity_governance_ms import get_entra_users_with_changes
@@ -184,7 +284,7 @@ result = sync_entra_to_google_ou(
         }
     },
     filter_criteria="officeLocation eq 'Seattle' or officeLocation eq 'NYC'",
-    email_domain_mapping={"@company.com": "@company.google.com"}  # Optional if domains differ
+    email_domain_mapping={"@company.com": "@company.google.com"}  # optional
 )
 
 # Returns a dictionary with keys: 'synced', 'skipped', 'failed'
@@ -192,45 +292,59 @@ print(f"Synced: {len(result['synced'])} users")
 print(f"Skipped (not in Google): {len(result['skipped'])} users")
 print(f"Failed: {len(result['failed'])} users")
 
-# Access details of synced users
 for user in result['synced']:
     print(f"{user['email']} moved from {user['previous_ou']} to {user['target_ou']}")
 ```
 
+---
+
 ## Production-Ready Considerations
 
-These scripts incorporate infrastructure patterns suitable for enterprise deployment:
+**API Resilience**
+Full pagination via `@odata.nextLink` (Microsoft Graph) and `nextPageToken` (Google Admin SDK) ensures complete result sets in organizations with 10,000+ users.
 
-**API Resilience:** Built-in handling for `@odata.nextLink` (Microsoft) and `nextPageToken` (Google) to support environments with 10,000+ users. All user queries handle pagination automatically.
+**Idempotency & Pre-flight Checks**
+Before applying changes, functions verify current state — for example, checking the user's current OU before moving — to prevent blind updates and unnecessary API calls. Users already in the target OU are skipped.
 
-**Idempotency & Pre-flight Checks:** Functions verify the current state (e.g., current OU) before applying changes to prevent "blind updates" and unnecessary API overhead. This helps catch cases where the user might already be in a different OU than expected, which could indicate a data inconsistency or that the move was already performed.
+**Principle of Least Privilege**
+Each function requests only the minimum scopes required. `admin.directory.user.security` is requested separately from general directory access rather than relying on broad Super Admin rights.
 
-**Principle of Least Privilege:** Scripts use granular scopes (e.g., `admin.directory.user.security`) rather than global Super Admin rights. Each function requests only the minimum permissions required.
+**Structured Logging**
+All output uses Python's `logging` module with appropriate levels: `INFO` for status, `WARNING` for security findings, `ERROR` for failures. This makes the scripts ready for SIEM/SOAR integration out of the box (Splunk, Google SecOps, Microsoft Sentinel).
 
-**Structured Logging:** Ready for SIEM/SOAR integration (Splunk, Google SecOps, Microsoft Sentinel) via Python's logging module. All output uses appropriate log levels (INFO for general status, WARNING for security findings like risky sign-ins or untrusted guests, ERROR for failures) instead of print statements. This provides actionable information for security teams to investigate potential threats.
+**Performance Optimization**
+Complex filtering (e.g., risk level thresholds, domain matching) is applied in Python after retrieval rather than via OData lambda operators, ensuring reliable performance during high-traffic security events. Time-window queries target indexed fields to minimize response times.
 
-**Performance Optimization:** Complex array filtering is handled in Python rather than OData lambda operators to ensure highest performance during high-traffic security events. Time-based queries use indexed fields for optimal response times.
+**Portability**
+The `my_customer` alias and environment-based admin impersonation keep the scripts tenant-agnostic and suitable for multi-region deployment.
 
-**Portability:** Using the `my_customer` alias and environment-based admin impersonation ensures the code is tenant-agnostic and ready for multi-region deployment.
+---
 
 ## Deployment Options
 
-Scripts can be run as:
 - Scheduled jobs (cron, Task Scheduler)
-- Python scheduled tasks (using the `schedule` library)
-- Event-driven workflows (triggered by security alerts)
-- Integrated into monitoring dashboards
+- Python task schedulers (`schedule` library)
+- Event-driven workflows triggered by security alerts
 - Manual execution for incident response
 
-## Why This Approach Matters
+---
 
-**Security Monitoring:** These scripts provide programmatic access to security events (risky sign-ins, guest audits, OAuth token audits) that can be integrated into security workflows and monitoring systems.
+## Limitations
 
-**Post-Provisioning Sync:** While SCIM handles initial user provisioning, these scripts bridge the gap for ongoing attribute synchronization, particularly for organizational unit placement based on changing user attributes.
+- **Detection only:** These scripts report findings but do not perform automated remediation (e.g., revoking tokens, disabling accounts). Remediation is expected to be handled by downstream SOAR tooling or manual review.
+- **Not real-time:** Queries are batch-oriented and designed for scheduled execution. For real-time event streaming, consider Microsoft Graph change notifications or Google Cloud Pub/Sub.
+- **Requires existing provisioning:** `sync_entra_to_google_ou` assumes users already exist in Google Workspace. Initial provisioning is out of scope and expected to be handled via SCIM.
+- **Entra ID P1/P2 required:** `lastSignInDateTime` (used for guest inactivity checks) is only available on premium tenants. Users without this data are treated as inactive.
+- **Domain-wide delegation scope:** Broad domain-wide delegation is used for simplicity. In high-sensitivity environments, consider restricting delegation to specific OUs to reduce blast radius.
 
-**Operational Efficiency:** By handling complex filtering in Python rather than OData lambda operators, we ensure optimal performance during high-traffic security events. Pagination handling ensures complete coverage even in large organizations.
+---
+
+## Related Projects
+
+**[scim-sanity](https://github.com/thomaselliottbetz/scim-sanity)** — SCIM server conformance testing tool that validates endpoints against RFC 7643/7644. Covers the provisioning layer that this project builds on: use scim-sanity to verify your SCIM endpoint is spec-compliant before relying on it for user provisioning into Entra ID or Google Workspace.
+
+---
 
 ## Note on OAuth Scopes
 
-In a production environment, use Service Account Impersonation restricted by Organizational Unit rather than broad domain-wide delegation where possible, following the Principle of Least Privilege. This would limit the service account's scope to specific OUs, reducing the blast radius if credentials are compromised and providing finer-grained access control.
-
+In production, consider restricting service account impersonation to specific Organizational Units rather than using broad domain-wide delegation. This limits the blast radius if credentials are compromised and provides finer-grained access control in line with the Principle of Least Privilege.
