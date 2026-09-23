@@ -199,7 +199,8 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
             created = guest.get("createdDateTime", "Unknown")
 
             is_trusted = any(
-                trusted_domain.lower() in domain.lower()
+                domain.lower() == trusted_domain.lower()
+                or domain.lower().endswith("." + trusted_domain.lower())
                 for trusted_domain in trusted_domains
             ) if trusted_domains else False
 
