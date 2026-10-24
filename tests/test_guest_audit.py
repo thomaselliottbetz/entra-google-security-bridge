@@ -38,3 +38,18 @@ def test_guest_audit_domains_and_activity():
     assert emails("untrusted_active") == ["new@vendor.io"]
     assert r["trusted_inactive"] == []
     assert [x["domain"] for x in r["untrusted_inactive"] if "evil" in x["email"]] == ["evilpartner.com"]
+
+
+def test_last_activity_prefers_successful_over_failed_attempts():
+    act = lambda **kw: {"signInActivity": kw}
+    # failed attempt yesterday must not mask a stale last successful sign-in
+    g = act(lastSuccessfulSignInDateTime="2024-01-01T00:00:00Z",
+            lastSignInDateTime="2099-01-01T00:00:00Z",
+            lastNonInteractiveSignInDateTime="2099-01-02T00:00:00Z")
+    assert m._last_activity(g).year == 2024
+    # not backfilled: fall back to the later of the other two
+    g = act(lastSuccessfulSignInDateTime=None,
+            lastSignInDateTime="2023-01-01T00:00:00Z",
+            lastNonInteractiveSignInDateTime="2023-06-01T00:00:00Z")
+    assert m._last_activity(g).month == 6
+    assert m._last_activity({}) is None

@@ -99,12 +99,16 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
         credentials_path: Path to service account JSON key file
         blocked_scopes: List of OAuth scope URIs considered high-risk
                         (default: common drive and gmail scopes)
-        approved_apps: List of approved application name substrings for whitelist matching
-                       (default: [])
+        approved_apps: OAuth client IDs of approved applications (default: none). Accepts any
+                       iterable of client IDs, or a dict of {client_id: label}. Matching is an
+                       exact, case-insensitive comparison on client ID only; display names are
+                       attacker-controlled and are never used for approval.
 
     Returns:
-        Dictionary with keys 'high_risk', 'medium_risk', 'low_risk'. Each contains lists of
-        token dictionaries with user, app_name, client_id, scopes, and anonymous fields.
+        Dictionary with keys 'high_risk', 'medium_risk', 'low_risk', 'errors'. The risk keys
+        contain lists of token dictionaries with user, app_name, client_id, scopes, and
+        anonymous fields. 'errors' lists users whose tokens could not be retrieved
+        (user, error), i.e. coverage gaps in the audit.
 
     Note: Requires service account with domain-wide delegation and GOOGLE_ADMIN_EMAIL environment
     variable. admin.directory.user.security scope requires explicit approval in Google Workspace
@@ -127,9 +131,9 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
             'https://www.googleapis.com/auth/gmail.readonly',
             'https://www.googleapis.com/auth/gmail.send'
         ]
+    blocked_scopes = set(blocked_scopes)
 
-    if approved_apps is None:
-        approved_apps = []
+    approved_client_ids = {str(c).lower() for c in (approved_apps or [])}
 
     try:
         users = []
@@ -139,7 +143,7 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
             kwargs = {'customer': 'my_customer', 'maxResults': 500}
             if page_token:
                 kwargs['pageToken'] = page_token
-            users_result = service.users().list(**kwargs).execute()
+            users_result = service.users().list(**kwargs).execute(num_retries=3)
             users.extend(users_result.get('users', []))
             page_token = users_result.get('nextPageToken')
             if not page_token:
@@ -148,6 +152,7 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
         high_risk_tokens = []
         medium_risk_tokens = []
         low_risk_tokens = []
+        errors = []
 
         logger.info(f"Auditing OAuth tokens for {len(users)} users...")
 
@@ -157,7 +162,7 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
                 continue
 
             try:
-                tokens_result = service.tokens().list(userKey=user_email).execute()
+                tokens_result = service.tokens().list(userKey=user_email).execute(num_retries=3)
                 tokens = tokens_result.get('items', [])
 
                 for token in tokens:
@@ -167,10 +172,7 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
                     anonymous = token.get('anonymous', False)
 
                     has_blocked_scope = any(scope in blocked_scopes for scope in token_scopes)
-                    is_approved = any(
-                        app.lower() in display_text.lower() or app.lower() in client_id.lower()
-                        for app in approved_apps
-                    )
+                    is_approved = client_id.lower() in approved_client_ids
 
                     token_info = {
                         'user': user_email,
@@ -188,10 +190,17 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
                         low_risk_tokens.append(token_info)
 
             except Exception as e:
-                logger.debug(f"Could not retrieve tokens for {user_email}: {e}")
+                logger.warning(f"Could not retrieve tokens for {user_email}; user not audited: {e}")
+                errors.append({'user': user_email, 'error': str(e)})
                 continue
 
         logger.info("OAuth Token Audit Results:")
+        audited = sum(1 for u in users if u.get('primaryEmail')) - len(errors)
+        if errors:
+            logger.warning(
+                f"COVERAGE GAP: audited {audited} of {audited + len(errors)} users; "
+                f"{len(errors)} could not be audited."
+            )
 
         if high_risk_tokens:
             logger.warning(f"HIGH RISK ({len(high_risk_tokens)} tokens): These apps have blocked scopes and are not approved.")
@@ -214,7 +223,8 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
         return {
             'high_risk': high_risk_tokens,
             'medium_risk': medium_risk_tokens,
-            'low_risk': low_risk_tokens
+            'low_risk': low_risk_tokens,
+            'errors': errors
         }
 
     except Exception as e:

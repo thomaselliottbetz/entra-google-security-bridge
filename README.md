@@ -58,15 +58,15 @@ Entra ID (Microsoft Graph API)          Google Workspace (Admin SDK)
 
 Detects suspicious sign-in patterns by querying Microsoft Identity Protection. Results include user email, risk level (low/medium/high), IP address, geographic location, and the specific risk event types that triggered the alert — for example, `anonymousIP` for VPN/Tor usage or `unfamiliarFeatures` for sign-ins from new locations.
 
-Risk level filtering is applied in Python after retrieval rather than via OData lambda operators. The time-window filter uses indexed `createdDateTime` fields to minimize API latency and avoid 429 throttling. Full pagination via `@odata.nextLink` ensures no events are missed.
+Risk level filtering is applied in Python after retrieval rather than via OData lambda operators. The time-window filter uses indexed `createdDateTime` fields to minimize API latency. Requests carry a timeout and retry on 429/503 responses, honoring `Retry-After` with capped exponential backoff. Full pagination via `@odata.nextLink` ensures no events are missed.
 
 **Guest User Audit (Zero-Trust)**
 
-Flags stale or untrusted external identities (B2B users) for access review or revocation. Guest users are identified by `userType eq 'Guest'` in Microsoft Graph and categorized by trust level (trusted vs. untrusted domains) and activity status (based on `signInActivity`, taking the later of interactive and non-interactive sign-ins), making it straightforward to prioritize removals for zero-trust compliance.
+Flags stale or untrusted external identities (B2B users) for access review or revocation. Guest users are identified by `userType eq 'Guest'` in Microsoft Graph and categorized by trust level (trusted vs. untrusted domains) and activity status (based on `signInActivity`: the last successful sign-in when available, since failed attempts would otherwise make a stale account look active, falling back to the later of interactive and non-interactive attempts for sign-ins recorded before December 2023), making it straightforward to prioritize removals for zero-trust compliance.
 
 A guest's home domain is taken from `mail`, or recovered from the `#EXT#` UPN when `mail` is empty, since the text after `@` in a guest UPN is the host tenant rather than the guest's organization. Guests with no recorded sign-in count as inactive only once they are older than the inactivity window, so freshly invited guests aren't flagged.
 
-Note: `signInActivity` requires `AuditLog.Read.All` and an Entra ID P1/P2 license. If it is unavailable, the audit logs a warning and judges activity from `createdDateTime` alone.
+Note: `signInActivity` requires `AuditLog.Read.All` and an Entra ID P1/P2 license. If either is missing, Graph typically rejects the request with a 403; the audit then logs the error and returns empty results. If the request succeeds but the property is omitted, the audit logs a warning and judges activity from `createdDateTime` alone.
 
 **Tech Stack:** MSAL, Microsoft Graph API, OData
 
@@ -92,7 +92,7 @@ Provides tools for user relocation during role changes or incident response. Inc
 
 **Shadow IT / OAuth Token Audit**
 
-Scans all users for high-risk OAuth grants (e.g., `drive.readonly`, `gmail.send`) and flags applications not on the approved allowlist. Each token record includes the application name, granted scopes, and whether the application is anonymous. Results are categorized into high-risk (blocked scopes, not approved), medium-risk (sensitive scopes from unknown apps), and low-risk (approved apps or safe scopes). Full pagination handles organizations with thousands of users.
+Scans all users for high-risk OAuth grants (e.g., `drive.readonly`, `gmail.send`) and flags applications not on the approved allowlist. The allowlist is matched on exact OAuth client ID, never on display name, since display names are attacker-controlled. Users whose tokens cannot be retrieved are logged at `WARNING` and returned under an `errors` key, so coverage gaps are visible. Each token record includes the application name, granted scopes, and whether the application is anonymous. Results are categorized into high-risk (blocked scopes, not approved), medium-risk (sensitive scopes from unknown apps), and low-risk (approved apps or safe scopes). Full pagination handles organizations with thousands of users.
 
 **Tech Stack:** Google Admin SDK, Google Auth Library
 
@@ -247,10 +247,11 @@ token_report = audit_oauth_tokens(
         'https://www.googleapis.com/auth/drive',
         'https://www.googleapis.com/auth/gmail.send'
     ],
-    approved_apps=['Google Workspace', 'Slack', 'Microsoft']
+    approved_apps={'1234567890-abc.apps.googleusercontent.com': 'Slack'}  # OAuth client IDs
 )
 
-# Returns a dictionary with keys: 'high_risk', 'medium_risk', 'low_risk'
+# Returns a dictionary with keys: 'high_risk', 'medium_risk', 'low_risk', 'errors'
+# ('errors' lists users whose tokens could not be retrieved)
 print(f"High-risk tokens found: {len(token_report.get('high_risk', []))}")
 ```
 
@@ -312,8 +313,8 @@ Before applying changes, functions verify current state — for example, checkin
 **Principle of Least Privilege**
 Each function requests only the minimum scopes required. `admin.directory.user.security` is requested separately from general directory access rather than relying on broad Super Admin rights.
 
-**Structured Logging**
-All output uses Python's `logging` module with appropriate levels: `INFO` for status, `WARNING` for security findings, `ERROR` for failures. This makes the scripts ready for SIEM/SOAR integration out of the box (Splunk, Google SecOps, Microsoft Sentinel).
+**Leveled Logging**
+All output uses Python's `logging` module with consistent levels: `INFO` for status, `WARNING` for security findings and audit coverage gaps, `ERROR` for failures. Log lines are plain text with `key: value` fields; they can be forwarded to a SIEM/SOAR platform (Splunk, Google SecOps, Microsoft Sentinel) through a log shipper and parsed there, but the scripts do not emit JSON themselves.
 
 **Performance Optimization**
 Complex filtering (e.g., risk level thresholds, domain matching) is applied in Python after retrieval rather than via OData lambda operators, ensuring reliable performance during high-traffic security events. Time-window queries target indexed fields to minimize response times.
@@ -337,7 +338,7 @@ The `my_customer` alias and environment-based admin impersonation keep the scrip
 - **Detection only:** These scripts report findings but do not perform automated remediation (e.g., revoking tokens, disabling accounts). Remediation is expected to be handled by downstream SOAR tooling or manual review.
 - **Not real-time:** Queries are batch-oriented and designed for scheduled execution. For real-time event streaming, consider Microsoft Graph change notifications or Google Cloud Pub/Sub.
 - **Requires existing provisioning:** `sync_entra_to_google_ou` assumes users already exist in Google Workspace. Initial provisioning is out of scope and expected to be handled via SCIM.
-- **Entra ID P1/P2 required:** `signInActivity` (used for guest inactivity checks) is only available on premium tenants. Without it, guests older than the inactivity window are treated as inactive.
+- **Entra ID P1/P2 required:** `signInActivity` (used for guest inactivity checks) is only available on premium tenants. On a non-premium tenant the guest audit is expected to fail with an error (logged) rather than produce results.
 - **Domain-wide delegation scope:** Broad domain-wide delegation is used for simplicity. In high-sensitivity environments, consider restricting delegation to specific OUs to reduce blast radius.
 
 ---

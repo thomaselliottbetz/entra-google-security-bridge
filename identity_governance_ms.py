@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -30,6 +31,45 @@ def _get_graph_headers(tenant_id, client_id, client_secret):
     }
 
 
+_RETRYABLE_STATUS = (429, 503)
+_REQUEST_TIMEOUT = 30
+_MAX_ATTEMPTS = 5
+_MAX_BACKOFF = 60
+
+
+def _graph_get(url, headers, params=None):
+    """
+    GET against Microsoft Graph with a timeout and retry on throttling.
+
+    Retries on 429 and 503, honoring the Retry-After header and otherwise backing off
+    exponentially (capped at _MAX_BACKOFF seconds). Returns the final response, which
+    the caller checks with raise_for_status(). Network errors propagate as
+    requests.exceptions.RequestException once attempts are exhausted.
+    """
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=_REQUEST_TIMEOUT)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if attempt == _MAX_ATTEMPTS:
+                raise
+            delay = min(2 ** attempt, _MAX_BACKOFF)
+            logger.warning(f"Graph request failed ({e}); retrying in {delay}s (attempt {attempt}/{_MAX_ATTEMPTS})")
+            time.sleep(delay)
+            continue
+
+        if response.status_code not in _RETRYABLE_STATUS or attempt == _MAX_ATTEMPTS:
+            return response
+
+        try:
+            delay = min(float(response.headers.get("Retry-After")), _MAX_BACKOFF)
+        except (TypeError, ValueError):
+            delay = min(2 ** attempt, _MAX_BACKOFF)
+        logger.warning(
+            f"Graph returned {response.status_code}; retrying in {delay}s (attempt {attempt}/{_MAX_ATTEMPTS})"
+        )
+        time.sleep(delay)
+
+
 def _parse_graph_datetime(value):
     """Parses a Graph ISO 8601 timestamp; returns None for missing or malformed values."""
     if not value or not isinstance(value, str):
@@ -44,10 +84,18 @@ def _last_activity(guest):
     """
     Returns the most recent sign-in time from a user's signInActivity, or None.
 
-    Takes the later of interactive and non-interactive sign-ins, so guests who only
-    reach the tenant through token refresh or app access aren't mistaken for stale.
+    Prefers lastSuccessfulSignInDateTime, since lastSignInDateTime and
+    lastNonInteractiveSignInDateTime also record failed attempts, which would make a
+    stale account under attack look active. That field is not backfilled before
+    December 2023, so when it is absent this falls back to the later of the interactive
+    and non-interactive times, so guests who only reach the tenant through token refresh
+    or app access aren't mistaken for stale.
     """
     activity = guest.get("signInActivity") or {}
+    successful = _parse_graph_datetime(activity.get("lastSuccessfulSignInDateTime"))
+    if successful:
+        return successful
+
     times = [
         _parse_graph_datetime(activity.get("lastSignInDateTime")),
         _parse_graph_datetime(activity.get("lastNonInteractiveSignInDateTime")),
@@ -122,9 +170,9 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
         page_url = graph_url
 
         while page_url:
-            response = requests.get(
+            response = _graph_get(
                 page_url,
-                headers=headers,
+                headers,
                 params=params if page_url == graph_url else None
             )
             response.raise_for_status()
@@ -190,8 +238,8 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
         'untrusted_inactive'. Each contains lists of guest user dictionaries with email,
         display_name, domain, last_sign_in, created, external_user_state.
 
-    Activity is read from signInActivity (the later of interactive and non-interactive
-    sign-ins). Guests with no sign-in on record count as inactive only once their
+    Activity is read from signInActivity (the last successful sign-in when available,
+    otherwise the later of the interactive and non-interactive attempts). Guests with no sign-in on record count as inactive only once their
     createdDateTime falls outside the inactivity window.
 
     Note: Requires User.Read.All (or Directory.Read.All) plus AuditLog.Read.All application
@@ -224,9 +272,9 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
         page_url = graph_url
 
         while page_url:
-            response = requests.get(
+            response = _graph_get(
                 page_url,
-                headers=headers,
+                headers,
                 params=params if page_url == graph_url else None
             )
             response.raise_for_status()
@@ -372,7 +420,7 @@ def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_cri
         page_url = query_url
 
         while page_url:
-            response = requests.get(page_url, headers=headers)
+            response = _graph_get(page_url, headers)
             response.raise_for_status()
             data = response.json()
             page_users = data.get('value', [])
