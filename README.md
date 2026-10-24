@@ -320,16 +320,21 @@ All output uses Python's `logging` module with consistent levels: `INFO` for sta
 BRIDGE_LOG_FORMAT=json python your_script.py 2>> bridge.jsonl
 ```
 
-Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `message`. Each finding additionally carries a stable `event` key and event-specific fields; summary and status lines do not, so detection rules should filter on `event`:
+Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `message`. Each finding additionally carries a stable `event` key and event-specific fields; other status lines do not, so detection rules should filter on `event`. JSON output is complete: every medium-risk OAuth token is emitted as its own event, whereas text output shows only the first 10 followed by a count. Each audit run also emits one `*_summary` event, including when it finds nothing, so a dashboard or alert can detect that a scheduled job has stopped running:
 
 | `event` | Fields |
 |---|---|
 | `risky_sign_in` | `user`, `risk_level`, `risk_state`, `time`, `ip_address`, `city`, `country`, `risk_events` |
-| `guest_untrusted_inactive`, `guest_untrusted_active` | `user`, `display_name`, `domain`, `last_sign_in`, `created_at` |
+| `guest_untrusted_inactive`, `guest_untrusted_active`, `guest_trusted_inactive` | `user`, `display_name`, `domain`, `last_sign_in`, `created_at` |
 | `oauth_high_risk_token` | `user`, `app_name`, `client_id`, `blocked_scopes`, `anonymous` |
+| `oauth_medium_risk_token` | `user`, `app_name`, `client_id`, `scopes`, `anonymous` |
 | `oauth_token_fetch_failed` | `user`, `error` |
 | `oauth_audit_coverage_gap` | `users_audited`, `users_total`, `users_failed` |
 | `ou_sync_failed` | `user`, `target_ou`, `error` |
+| `risky_sign_in_summary` | `findings`, `hours_back`, `min_risk_level` |
+| `guest_audit_summary` | `guests_total`, `days_inactive`, `trusted_active`, `trusted_inactive`, `untrusted_active`, `untrusted_inactive` |
+| `oauth_audit_summary` | `users_audited`, `users_total`, `users_failed`, `high_risk`, `medium_risk`, `low_risk` |
+| `ou_sync_summary` | `synced`, `skipped`, `failed` |
 
 This is output designed for ingestion, not a packaged integration: the scripts ship no SIEM connectors, schemas, or dashboards. Logging is configured on import only if the host application has not already configured it; an application with its own logging setup can attach `identity_governance_ms.JsonFormatter` to its handler instead.
 

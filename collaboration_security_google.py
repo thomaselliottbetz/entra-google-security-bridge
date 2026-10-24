@@ -196,8 +196,19 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
                 errors.append({'user': user_email, 'error': str(e)})
                 continue
 
-        logger.info("OAuth Token Audit Results:")
         audited = sum(1 for u in users if u.get('primaryEmail')) - len(errors)
+        logger.info(
+            "OAuth Token Audit Results:",
+            extra={
+                "event": "oauth_audit_summary",
+                "users_audited": audited,
+                "users_total": audited + len(errors),
+                "users_failed": len(errors),
+                "high_risk": len(high_risk_tokens),
+                "medium_risk": len(medium_risk_tokens),
+                "low_risk": len(low_risk_tokens),
+            },
+        )
         if errors:
             logger.warning(
                 f"COVERAGE GAP: audited {audited} of {audited + len(errors)} users; "
@@ -229,10 +240,22 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
 
         if medium_risk_tokens:
             logger.info(f"MEDIUM RISK ({len(medium_risk_tokens)} tokens): These apps have sensitive permissions but may be legitimate.")
-            for token in medium_risk_tokens[:10]:
-                logger.info(f"  User: {token['user']} | App: {token['app_name']}")
+            # Text output shows the first 10; JSON output carries every token (json_only).
+            for i, token in enumerate(medium_risk_tokens):
+                logger.info(
+                    f"  User: {token['user']} | App: {token['app_name']}",
+                    extra={
+                        "event": "oauth_medium_risk_token",
+                        "user": token['user'],
+                        "app_name": token['app_name'],
+                        "client_id": token['client_id'],
+                        "scopes": token['scopes'],
+                        "anonymous": token['anonymous'],
+                        "json_only": i >= 10,
+                    },
+                )
             if len(medium_risk_tokens) > 10:
-                logger.info(f"  ... and {len(medium_risk_tokens) - 10} more")
+                logger.info(f"  ... and {len(medium_risk_tokens) - 10} more", extra={"text_only": True})
 
         if low_risk_tokens:
             logger.info(f"LOW RISK ({len(low_risk_tokens)} tokens): These are approved apps or have safe permissions.")
@@ -376,7 +399,13 @@ def sync_entra_to_google_ou(
 
     logger.info(
         f"Sync complete: {len(synced_users)} synced, {len(skipped_users)} skipped "
-        f"(not in Google), {len(failed_users)} failed"
+        f"(not in Google), {len(failed_users)} failed",
+        extra={
+            "event": "ou_sync_summary",
+            "synced": len(synced_users),
+            "skipped": len(skipped_users),
+            "failed": len(failed_users),
+        },
     )
 
     if skipped_users:

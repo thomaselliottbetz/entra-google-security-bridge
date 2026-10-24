@@ -16,7 +16,9 @@ class JsonFormatter(logging.Formatter):
     via logging's `extra=` (findings carry a stable 'event' key and event-specific fields).
     """
 
-    _STANDARD_ATTRS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
+    _STANDARD_ATTRS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {
+        "message", "asctime", "json_only", "text_only"
+    }
 
     def format(self, record):
         payload = {
@@ -31,6 +33,23 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+class _ModeFilter(logging.Filter):
+    """
+    Drops records flagged for the other output mode.
+
+    Records carry `json_only=True` (complete detail that text output truncates) or
+    `text_only=True` (human-readable framing, e.g. "... and N more"). The text handler
+    drops json_only records and the JSON handler drops text_only records.
+    """
+
+    def __init__(self, drop_attr):
+        super().__init__()
+        self._drop_attr = drop_attr
+
+    def filter(self, record):
+        return not getattr(record, self._drop_attr, False)
+
+
 def _configure_logging():
     """
     Configures root logging: plain text by default, JSON lines when BRIDGE_LOG_FORMAT=json.
@@ -39,12 +58,13 @@ def _configure_logging():
     configured logging, so an application's own setup always takes precedence. Applications
     that want JSON under their own setup can attach JsonFormatter to their handler.
     """
-    handlers = None
+    handler = logging.StreamHandler()
     if os.environ.get("BRIDGE_LOG_FORMAT", "text").strip().lower() == "json":
-        handler = logging.StreamHandler()
         handler.setFormatter(JsonFormatter())
-        handlers = [handler]
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
+        handler.addFilter(_ModeFilter("text_only"))
+    else:
+        handler.addFilter(_ModeFilter("json_only"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 
 _configure_logging()
@@ -240,10 +260,26 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
         ]
 
         if not filtered_sign_ins:
-            logger.info(f"No risky sign-ins found in the last {hours_back} hours (minimum risk: {min_risk_level})")
+            logger.info(
+                f"No risky sign-ins found in the last {hours_back} hours (minimum risk: {min_risk_level})",
+                extra={
+                    "event": "risky_sign_in_summary",
+                    "findings": 0,
+                    "hours_back": hours_back,
+                    "min_risk_level": min_risk_level,
+                },
+            )
             return []
 
-        logger.warning(f"Found {len(filtered_sign_ins)} risky sign-in(s) in the last {hours_back} hours:")
+        logger.warning(
+            f"Found {len(filtered_sign_ins)} risky sign-in(s) in the last {hours_back} hours:",
+            extra={
+                "event": "risky_sign_in_summary",
+                "findings": len(filtered_sign_ins),
+                "hours_back": hours_back,
+                "min_risk_level": min_risk_level,
+            },
+        )
 
         for sign_in in filtered_sign_ins:
             user_principal_name = sign_in.get("userPrincipalName", "Unknown")
@@ -408,7 +444,16 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
 
         logger.info(
             f"Guest User Audit Report - Total guest users: {len(guest_users)}, "
-            f"Inactive threshold: {days_inactive} days"
+            f"Inactive threshold: {days_inactive} days",
+            extra={
+                "event": "guest_audit_summary",
+                "guests_total": len(guest_users),
+                "days_inactive": days_inactive,
+                "trusted_active": len(trusted_active),
+                "trusted_inactive": len(trusted_inactive),
+                "untrusted_active": len(untrusted_active),
+                "untrusted_inactive": len(untrusted_inactive),
+            },
         )
 
         if untrusted_inactive:
@@ -433,7 +478,10 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
         if trusted_inactive:
             logger.info(f"Trusted but Inactive ({len(trusted_inactive)}):")
             for guest in trusted_inactive:
-                logger.info(f"  {guest['email']} ({guest['display_name']}) | Last sign-in: {guest['last_sign_in']}")
+                logger.info(
+                    f"  {guest['email']} ({guest['display_name']}) | Last sign-in: {guest['last_sign_in']}",
+                    extra={"event": "guest_trusted_inactive", **_guest_log_fields(guest)},
+                )
 
         if trusted_active:
             logger.info(f"Trusted Active ({len(trusted_active)}): These are from trusted domains and have recent activity")

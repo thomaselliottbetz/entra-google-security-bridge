@@ -55,3 +55,80 @@ def test_finding_logs_carry_events(caplog):
         m.get_risky_sign_ins("t", "c", "s")
     rec = next(r for r in caplog.records if getattr(r, "event", "") == "risky_sign_in")
     assert rec.user == "u@x.com" and rec.risk_level == "high" and rec.country == "US"
+
+
+def _capture(fmt, fn):
+    """Runs fn() under a handler configured like _configure_logging for the given mode."""
+    import io
+    buf = io.StringIO()
+    h = logging.StreamHandler(buf)
+    if fmt == "json":
+        h.setFormatter(m.JsonFormatter())
+        h.addFilter(m._ModeFilter("text_only"))
+    else:
+        h.addFilter(m._ModeFilter("json_only"))
+    root = logging.getLogger()
+    old_level = root.level
+    root.addHandler(h); root.setLevel(logging.INFO)
+    try:
+        fn()
+    finally:
+        root.removeHandler(h); root.setLevel(old_level)
+    return [l for l in buf.getvalue().splitlines() if l]
+
+
+def _medium_audit(n):
+    import collaboration_security_google as g
+    toks = [{"clientId": f"c{i}", "displayText": f"app{i}", "scopes": ["https://x/readonly"]} for i in range(n)]
+    svc = mock.MagicMock()
+    svc.users().list().execute.return_value = {"users": [{"primaryEmail": "u@x.com"}]}
+    svc.tokens().list().execute.return_value = {"items": toks}
+    with mock.patch.object(g.service_account.Credentials, "from_service_account_file"), \
+         mock.patch.object(g, "_get_admin_email", return_value="a@x.com"), \
+         mock.patch.object(g, "build", return_value=svc):
+        return g.audit_oauth_tokens("creds.json")
+
+
+def test_medium_risk_tokens_all_reach_json_but_text_is_truncated():
+    jl = [json.loads(l) for l in _capture("json", lambda: _medium_audit(13))]
+    assert sum(1 for r in jl if r.get("event") == "oauth_medium_risk_token") == 13
+    assert not any("more" in r["message"] and "..." in r["message"] for r in jl)
+    assert all("json_only" not in r and "text_only" not in r for r in jl)
+    summary = next(r for r in jl if r.get("event") == "oauth_audit_summary")
+    assert summary["medium_risk"] == 13 and summary["users_audited"] == 1
+
+    text = _capture("text", lambda: _medium_audit(13))
+    assert sum(1 for l in text if "User: u@x.com | App: app" in l) == 10
+    assert any("... and 3 more" in l for l in text)
+
+
+def test_guest_audit_emits_trusted_inactive_and_summary():
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    iso = lambda d: (now - timedelta(days=d)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    guests = [{"userPrincipalName": "a_partner.com#EXT#@h.onmicrosoft.com", "mail": "a@partner.com",
+               "createdDateTime": iso(400), "signInActivity": {"lastSuccessfulSignInDateTime": iso(200)}}]
+    resp = mock.Mock(); resp.json.return_value = {"value": guests}; resp.raise_for_status.return_value = None
+
+    def run():
+        with mock.patch.object(m, "_get_graph_headers", return_value={}), \
+             mock.patch.object(m.requests, "get", return_value=resp):
+            m.audit_guest_users("t", "c", "s", trusted_domains=["partner.com"], days_inactive=90)
+
+    jl = [json.loads(l) for l in _capture("json", run)]
+    ti = next(r for r in jl if r.get("event") == "guest_trusted_inactive")
+    assert ti["user"] == "a@partner.com" and ti["domain"] == "partner.com"
+    s = next(r for r in jl if r.get("event") == "guest_audit_summary")
+    assert (s["guests_total"], s["trusted_inactive"], s["untrusted_inactive"]) == (1, 1, 0)
+
+
+def test_risky_sign_in_summary_emitted_even_with_zero_findings():
+    resp = mock.Mock(status_code=200); resp.json.return_value = {"value": []}
+
+    def run():
+        with mock.patch.object(m, "_get_graph_headers", return_value={}), \
+             mock.patch.object(m.requests, "get", return_value=resp):
+            m.get_risky_sign_ins("t", "c", "s")
+
+    s = next(json.loads(l) for l in _capture("json", run) if '"risky_sign_in_summary"' in l)
+    assert s["findings"] == 0 and s["hours_back"] == 24
