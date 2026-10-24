@@ -18,9 +18,9 @@ def _record(**extra):
 
 
 def test_json_formatter_emits_stable_fields_and_extras():
-    out = json.loads(m.JsonFormatter().format(_record(event="risky_sign_in", user="a@b.com", risk_events=["x"])))
+    out = json.loads(m.JsonFormatter().format(_record(event="risk_detection", user="a@b.com", risk_events=["x"])))
     assert out["level"] == "WARNING" and out["message"] == "msg x" and out["logger"] == "t"
-    assert out["event"] == "risky_sign_in" and out["user"] == "a@b.com" and out["risk_events"] == ["x"]
+    assert out["event"] == "risk_detection" and out["user"] == "a@b.com" and out["risk_events"] == ["x"]
     assert out["timestamp"].endswith("+00:00")
     assert "args" not in out and "msg" not in out and "lineno" not in out
 
@@ -46,14 +46,14 @@ def test_env_var_selects_json_and_text_is_default():
 
 def test_finding_logs_carry_events(caplog):
     from unittest import mock
-    sign_in = {"userPrincipalName": "u@x.com", "riskLevel": "high", "riskState": "atRisk",
+    detection = {"userPrincipalName": "u@x.com", "riskLevel": "high", "riskState": "atRisk",
                "detectedDateTime": "2026-01-01T00:00:00Z", "ipAddress": "1.2.3.4",
                "location": {"city": "Seattle", "countryOrRegion": "US"}, "riskEventType": "leakedCredentials"}
-    resp = mock.Mock(status_code=200); resp.json.return_value = {"value": [sign_in]}
+    resp = mock.Mock(status_code=200); resp.json.return_value = {"value": [detection]}
     with mock.patch.object(m, "_get_graph_headers", return_value={}), \
          mock.patch.object(m.requests, "get", return_value=resp), caplog.at_level("WARNING"):
-        m.get_risky_sign_ins("t", "c", "s")
-    rec = next(r for r in caplog.records if getattr(r, "event", "") == "risky_sign_in")
+        m.get_risk_detections("t", "c", "s")
+    rec = next(r for r in caplog.records if getattr(r, "event", "") == "risk_detection")
     assert rec.user == "u@x.com" and rec.risk_level == "high" and rec.country == "US"
     assert rec.time == "2026-01-01T00:00:00Z" and rec.risk_events == ["leakedCredentials"]
 
@@ -123,13 +123,13 @@ def test_guest_audit_emits_trusted_inactive_and_summary():
     assert (s["guests_total"], s["trusted_inactive"], s["untrusted_inactive"]) == (1, 1, 0)
 
 
-def test_risky_sign_in_summary_emitted_even_with_zero_findings():
+def test_risk_detection_summary_emitted_even_with_zero_findings():
     resp = mock.Mock(status_code=200); resp.json.return_value = {"value": []}
 
     def run():
         with mock.patch.object(m, "_get_graph_headers", return_value={}), \
              mock.patch.object(m.requests, "get", return_value=resp):
-            m.get_risky_sign_ins("t", "c", "s")
+            m.get_risk_detections("t", "c", "s")
 
-    s = next(json.loads(l) for l in _capture("json", run) if '"risky_sign_in_summary"' in l)
+    s = next(json.loads(l) for l in _capture("json", run) if '"risk_detection_summary"' in l)
     assert s["findings"] == 0 and s["hours_back"] == 24

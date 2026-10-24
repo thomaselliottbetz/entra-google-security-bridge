@@ -205,7 +205,7 @@ def _guest_home_domain(guest):
     return "Unknown"
 
 
-def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_risk_level='medium'):
+def get_risk_detections(tenant_id, client_id, client_secret, hours_back=24, min_risk_level='medium'):
     """
     Queries Entra ID Identity Protection risk detections (identityProtection/riskDetections).
 
@@ -249,7 +249,7 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
     }
 
     try:
-        risky_sign_ins = []
+        detections = []
         page_url = graph_url
 
         while page_url:
@@ -260,25 +260,25 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
             )
             response.raise_for_status()
             data = response.json()
-            risky_sign_ins.extend(data.get("value", []))
+            detections.extend(data.get("value", []))
             page_url = data.get("@odata.nextLink")
 
         # Filter by risk level in Python. Levels outside low/medium/high ('none', 'hidden')
         # rank below 'low' and are never reported.
-        filtered_sign_ins = [
-            s for s in risky_sign_ins
+        filtered_detections = [
+            s for s in detections
             if risk_level_map.get((s.get("riskLevel") or "").lower(), -1) >= min_level
         ]
-        filtered_sign_ins.sort(
+        filtered_detections.sort(
             key=lambda s: _parse_graph_datetime(s.get("detectedDateTime")) or datetime.min.replace(tzinfo=timezone.utc),
             reverse=True,
         )
 
-        if not filtered_sign_ins:
+        if not filtered_detections:
             logger.info(
-                f"No risky sign-ins found in the last {hours_back} hours (minimum risk: {min_risk_level})",
+                f"No risk detections found in the last {hours_back} hours (minimum risk: {min_risk_level})",
                 extra={
-                    "event": "risky_sign_in_summary",
+                    "event": "risk_detection_summary",
                     "findings": 0,
                     "hours_back": hours_back,
                     "min_risk_level": min_risk_level,
@@ -287,25 +287,25 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
             return []
 
         logger.warning(
-            f"Found {len(filtered_sign_ins)} risky sign-in(s) in the last {hours_back} hours:",
+            f"Found {len(filtered_detections)} risk detection(s) in the last {hours_back} hours:",
             extra={
-                "event": "risky_sign_in_summary",
-                "findings": len(filtered_sign_ins),
+                "event": "risk_detection_summary",
+                "findings": len(filtered_detections),
                 "hours_back": hours_back,
                 "min_risk_level": min_risk_level,
             },
         )
 
-        for sign_in in filtered_sign_ins:
-            user_principal_name = sign_in.get("userPrincipalName", "Unknown")
-            risk_level = sign_in.get("riskLevel") or "Unknown"
-            risk_state = sign_in.get("riskState") or "Unknown"
-            created_time = sign_in.get("detectedDateTime", "Unknown")
-            ip_address = sign_in.get("ipAddress") or "Unknown"
-            location = sign_in.get("location") or {}
+        for detection in filtered_detections:
+            user_principal_name = detection.get("userPrincipalName", "Unknown")
+            risk_level = detection.get("riskLevel") or "Unknown"
+            risk_state = detection.get("riskState") or "Unknown"
+            created_time = detection.get("detectedDateTime", "Unknown")
+            ip_address = detection.get("ipAddress") or "Unknown"
+            location = detection.get("location") or {}
             city = location.get("city") or "Unknown"
             country = location.get("countryOrRegion") or "Unknown"
-            risk_event_type = sign_in.get("riskEventType")
+            risk_event_type = detection.get("riskEventType")
             risk_event_types = [risk_event_type] if risk_event_type else []
 
             logger.warning(
@@ -314,7 +314,7 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
                 f"IP: {ip_address} | Location: {city}, {country} | "
                 f"Risk Events: {', '.join(risk_event_types) if risk_event_types else 'None'}",
                 extra={
-                    "event": "risky_sign_in",
+                    "event": "risk_detection",
                     "user": user_principal_name,
                     "risk_level": risk_level,
                     "risk_state": risk_state,
@@ -326,10 +326,10 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
                 },
             )
 
-        return filtered_sign_ins
+        return filtered_detections
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error querying risky sign-ins: {e}")
+        logger.error(f"Error querying risk detections: {e}")
         if e.response is not None:
             logger.error(f"Response: {e.response.text}")
         return []

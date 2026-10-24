@@ -39,7 +39,7 @@ Entra ID (Microsoft Graph API)          Google Workspace (Admin SDK)
 │ identity_governance │  ──────────▶ │ collaboration_security_    │
 │ _ms.py              │  user attrs  │ google.py                  │
 │                     │              │                            │
-│ • Risky sign-ins    │              │ • OU sync                  │
+│ • Risk detections   │              │ • OU sync                  │
 │ • Guest user audit  │              │ • OAuth token audit        │
 │ • User attr query   │              │ • OU management            │
 └─────────────────────┘              └────────────────────────────┘
@@ -54,7 +54,7 @@ Entra ID (Microsoft Graph API)          Google Workspace (Admin SDK)
 
 ### 1. Identity Governance (Entra ID)
 
-**Risky Sign-In Monitoring**
+**Risk Detection Monitoring**
 
 Detects suspicious sign-in activity by querying Microsoft Entra ID Protection risk detections (`/identityProtection/riskDetections`). Each result is one risk detection and includes the user, risk level (low/medium/high), IP address, geographic location, and the risk event type that triggered it — for example, `anonymizedIPAddress` for anonymizing VPN/Tor use or `newCountry` for activity from a new country. A single sign-in can produce several detections, and offline detections such as `leakedCredentials` may carry no IP address or location. Requires `IdentityRiskEvent.Read.All` and an Entra ID P1/P2 license.
 
@@ -102,7 +102,7 @@ Scans all users for high-risk OAuth grants (e.g., `drive.readonly`, `gmail.send`
 
 | File | Description |
 |------|-------------|
-| `identity_governance_ms.py` | Risky sign-in monitoring, guest user audit, and Entra ID attribute query for post-provisioning sync |
+| `identity_governance_ms.py` | Risk detection monitoring, guest user audit, and Entra ID attribute query for post-provisioning sync |
 | `collaboration_security_google.py` | Google Workspace OU management (`move_user_to_ou`, `move_user_between_ous`), OAuth token audit, and cross-platform OU sync |
 
 ---
@@ -151,7 +151,7 @@ pip install -r requirements.txt
 
 | Permission | Purpose |
 |---|---|
-| `IdentityRiskEvent.Read.All` | Risky sign-in monitoring |
+| `IdentityRiskEvent.Read.All` | Risk detection monitoring |
 | `User.Read.All` | User attribute queries |
 | `Directory.Read.All` | Guest user audit |
 | `AuditLog.Read.All` | Guest sign-in activity (`signInActivity`) |
@@ -170,12 +170,12 @@ All permissions require application-level grants with admin consent.
 
 ## Usage Examples
 
-### Monitor Risky Sign-Ins
+### Monitor Risk Detections
 
 ```python
-from identity_governance_ms import get_risky_sign_ins
+from identity_governance_ms import get_risk_detections
 
-risky_signins = get_risky_sign_ins(
+detections = get_risk_detections(
     tenant_id="your-tenant-id",
     client_id="your-app-client-id",
     client_secret="your-client-secret",
@@ -324,14 +324,14 @@ Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `messag
 
 | `event` | Fields |
 |---|---|
-| `risky_sign_in` | `user`, `risk_level`, `risk_state`, `time`, `ip_address`, `city`, `country`, `risk_events` |
+| `risk_detection` | `user`, `risk_level`, `risk_state`, `time`, `ip_address`, `city`, `country`, `risk_events` |
 | `guest_untrusted_inactive`, `guest_untrusted_active`, `guest_trusted_inactive` | `user`, `display_name`, `domain`, `last_sign_in`, `created_at` |
 | `oauth_high_risk_token` | `user`, `app_name`, `client_id`, `blocked_scopes`, `anonymous` |
 | `oauth_medium_risk_token` | `user`, `app_name`, `client_id`, `scopes`, `anonymous` |
 | `oauth_token_fetch_failed` | `user`, `error` |
 | `oauth_audit_coverage_gap` | `users_audited`, `users_total`, `users_failed` |
 | `ou_sync_failed` | `user`, `target_ou`, `error` |
-| `risky_sign_in_summary` | `findings`, `hours_back`, `min_risk_level` |
+| `risk_detection_summary` | `findings`, `hours_back`, `min_risk_level` |
 | `guest_audit_summary` | `guests_total`, `days_inactive`, `trusted_active`, `trusted_inactive`, `untrusted_active`, `untrusted_inactive` |
 | `oauth_audit_summary` | `users_audited`, `users_total`, `users_failed`, `high_risk`, `medium_risk`, `low_risk` |
 | `ou_sync_summary` | `synced`, `skipped`, `failed` |

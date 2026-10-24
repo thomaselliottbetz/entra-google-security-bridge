@@ -15,7 +15,7 @@ def _run(detections, **kw):
     resp = mock.Mock(status_code=200); resp.json.return_value = {"value": detections}
     with mock.patch.object(m, "_get_graph_headers", return_value={}), \
          mock.patch.object(m.requests, "get", return_value=resp) as get:
-        return m.get_risky_sign_ins("t", "c", "s", **kw), get
+        return m.get_risk_detections("t", "c", "s", **kw), get
 
 
 def test_queries_risk_detections_filtered_on_detected_time():
@@ -50,7 +50,7 @@ def test_offline_detection_without_location_or_ip_does_not_crash(caplog):
     with caplog.at_level("WARNING"):
         out, _ = _run([det])
     assert len(out) == 1
-    rec = next(r for r in caplog.records if getattr(r, "event", "") == "risky_sign_in")
+    rec = next(r for r in caplog.records if getattr(r, "event", "") == "risk_detection")
     assert rec.ip_address == "Unknown" and rec.city == "Unknown" and rec.risk_events == ["leakedCredentials"]
 
 
@@ -58,5 +58,5 @@ def test_missing_event_type_yields_empty_list(caplog):
     det = _det("high", "2026-01-01T00:00:00Z"); det.pop("riskEventType")
     with caplog.at_level("WARNING"):
         _run([det])
-    rec = next(r for r in caplog.records if getattr(r, "event", "") == "risky_sign_in")
+    rec = next(r for r in caplog.records if getattr(r, "event", "") == "risk_detection")
     assert rec.risk_events == []
