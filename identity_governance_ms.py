@@ -30,6 +30,56 @@ def _get_graph_headers(tenant_id, client_id, client_secret):
     }
 
 
+def _parse_graph_datetime(value):
+    """Parses a Graph ISO 8601 timestamp; returns None for missing or malformed values."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _last_activity(guest):
+    """
+    Returns the most recent sign-in time from a user's signInActivity, or None.
+
+    Takes the later of interactive and non-interactive sign-ins, so guests who only
+    reach the tenant through token refresh or app access aren't mistaken for stale.
+    """
+    activity = guest.get("signInActivity") or {}
+    times = [
+        _parse_graph_datetime(activity.get("lastSignInDateTime")),
+        _parse_graph_datetime(activity.get("lastNonInteractiveSignInDateTime")),
+    ]
+    times = [t for t in times if t]
+    return max(times) if times else None
+
+
+def _guest_home_domain(guest):
+    """
+    Returns a B2B guest's home domain (the organization they belong to).
+
+    Guest UPNs take the form 'jane_partner.com#EXT#@hosttenant.onmicrosoft.com', so the
+    text after '@' is the host tenant, not the guest's organization. Prefer the mail
+    attribute; otherwise recover the domain from the part before '#EXT#'.
+    """
+    mail = guest.get("mail")
+    if mail and "@" in mail:
+        return mail.rsplit("@", 1)[1].lower()
+
+    upn = guest.get("userPrincipalName") or ""
+    if "#EXT#" in upn:
+        original = upn.split("#EXT#", 1)[0]
+        # The original address's '@' became the last underscore.
+        if "_" in original:
+            return original.rsplit("_", 1)[1].lower()
+    elif "@" in upn:
+        return upn.rsplit("@", 1)[1].lower()
+
+    return "Unknown"
+
+
 def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_risk_level='medium'):
     """
     Queries Entra ID Identity Protection API for risky sign-in events.
@@ -140,8 +190,12 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
         'untrusted_inactive'. Each contains lists of guest user dictionaries with email,
         display_name, domain, last_sign_in, created, external_user_state.
 
-    Note: Requires User.Read.All or Directory.Read.All application permission with admin consent.
-    lastSignInDateTime requires Entra ID P1/P2 license.
+    Activity is read from signInActivity (the later of interactive and non-interactive
+    sign-ins). Guests with no sign-in on record count as inactive only once their
+    createdDateTime falls outside the inactivity window.
+
+    Note: Requires User.Read.All (or Directory.Read.All) plus AuditLog.Read.All application
+    permissions with admin consent. signInActivity requires an Entra ID P1/P2 license.
     """
     empty_result = {
         "trusted_active": [],
@@ -162,7 +216,7 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
     graph_url = "https://graph.microsoft.com/v1.0/users"
     params = {
         "$filter": "userType eq 'Guest'",
-        "$select": "id,userPrincipalName,displayName,mail,userType,externalUserState,createdDateTime,lastSignInDateTime"
+        "$select": "id,userPrincipalName,displayName,mail,userType,externalUserState,createdDateTime,signInActivity"
     }
 
     try:
@@ -191,10 +245,18 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
         untrusted_active = []
         untrusted_inactive = []
 
+        if not any("signInActivity" in g for g in guest_users):
+            logger.warning(
+                "signInActivity was not returned for any guest. Check that the app has "
+                "AuditLog.Read.All and the tenant has Entra ID P1/P2; until then, activity "
+                "is judged from createdDateTime only."
+            )
+
         for guest in guest_users:
-            email = guest.get("userPrincipalName", guest.get("mail", "Unknown"))
-            domain = email.split("@")[-1] if "@" in email else "Unknown"
-            last_sign_in = guest.get("lastSignInDateTime")
+            email = guest.get("mail") or guest.get("userPrincipalName") or "Unknown"
+            domain = _guest_home_domain(guest)
+            last_sign_in_dt = _last_activity(guest)
+            last_sign_in = last_sign_in_dt.isoformat() if last_sign_in_dt else None
             display_name = guest.get("displayName", "Unknown")
             created = guest.get("createdDateTime", "Unknown")
 
@@ -204,13 +266,13 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
                 for trusted_domain in trusted_domains
             ) if trusted_domains else False
 
-            is_inactive = True
-            if last_sign_in:
-                try:
-                    last_sign_in_date = datetime.fromisoformat(last_sign_in.replace("Z", "+00:00"))
-                    is_inactive = last_sign_in_date < cutoff_date
-                except (ValueError, AttributeError, TypeError):
-                    pass
+            if last_sign_in_dt:
+                is_inactive = last_sign_in_dt < cutoff_date
+            else:
+                # No sign-in on record. A guest invited inside the window hasn't had a
+                # chance to go stale yet; anything older that never signed in has.
+                created_dt = _parse_graph_datetime(created)
+                is_inactive = created_dt is None or created_dt < cutoff_date
 
             guest_info = {
                 "email": email,
