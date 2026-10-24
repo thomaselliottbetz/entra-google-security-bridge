@@ -207,10 +207,12 @@ def _guest_home_domain(guest):
 
 def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_risk_level='medium'):
     """
-    Queries Entra ID Identity Protection API for risky sign-in events.
+    Queries Entra ID Identity Protection risk detections (identityProtection/riskDetections).
 
-    Returns sign-ins flagged by Microsoft's risk detection within the specified time window.
-    Filters by minimum risk level and logs detailed information for security investigation.
+    Returns detections made within the specified time window, newest first. Filters by
+    minimum risk level and logs detailed information for security investigation. A single
+    sign-in can produce several detections, and offline detections (e.g. leaked credentials)
+    may have no sign-in, IP address, or location attached.
 
     Args:
         tenant_id: Entra ID tenant ID
@@ -220,9 +222,13 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
         min_risk_level: Minimum risk level to include ('low', 'medium', 'high', default: 'medium')
 
     Returns:
-        List of risky sign-in event dictionaries. Each includes userPrincipalName, riskLevel,
-        riskState, createdDateTime, ipAddress, location (city, countryOrRegion), and
-        riskEventTypes.
+        List of riskDetection dictionaries. Each includes userPrincipalName, riskLevel,
+        riskState, detectedDateTime, ipAddress, location (city, countryOrRegion), and
+        riskEventType (a single string).
+
+    Note: Requires IdentityRiskEvent.Read.All application permission with admin consent and
+    an Entra ID P1/P2 license. The time window applies to detectedDateTime, when the risk was
+    detected, which for offline detections can be later than the activity itself.
     """
     try:
         headers = _get_graph_headers(tenant_id, client_id, client_secret)
@@ -236,10 +242,10 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
     risk_level_map = {"low": 0, "medium": 1, "high": 2}
     min_level = risk_level_map.get(min_risk_level.lower(), 1)
 
-    graph_url = "https://graph.microsoft.com/v1.0/identityProtection/riskySignIns"
+    graph_url = "https://graph.microsoft.com/v1.0/identityProtection/riskDetections"
+    # riskDetections documents $filter and $select only, so ordering is done in Python.
     params = {
-        "$filter": f"createdDateTime ge {start_time_str}",
-        "$orderby": "createdDateTime desc",
+        "$filter": f"detectedDateTime ge {start_time_str}",
     }
 
     try:
@@ -257,11 +263,16 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
             risky_sign_ins.extend(data.get("value", []))
             page_url = data.get("@odata.nextLink")
 
-        # Filter by risk level in Python (all results already have risk events associated)
+        # Filter by risk level in Python. Levels outside low/medium/high ('none', 'hidden')
+        # rank below 'low' and are never reported.
         filtered_sign_ins = [
             s for s in risky_sign_ins
-            if risk_level_map.get(s.get("riskLevel", "").lower(), 0) >= min_level
+            if risk_level_map.get((s.get("riskLevel") or "").lower(), -1) >= min_level
         ]
+        filtered_sign_ins.sort(
+            key=lambda s: _parse_graph_datetime(s.get("detectedDateTime")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
 
         if not filtered_sign_ins:
             logger.info(
@@ -287,14 +298,15 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
 
         for sign_in in filtered_sign_ins:
             user_principal_name = sign_in.get("userPrincipalName", "Unknown")
-            risk_level = sign_in.get("riskLevel", "Unknown")
-            risk_state = sign_in.get("riskState", "Unknown")
-            created_time = sign_in.get("createdDateTime", "Unknown")
-            ip_address = sign_in.get("ipAddress", "Unknown")
-            location = sign_in.get("location", {})
-            city = location.get("city", "Unknown")
-            country = location.get("countryOrRegion", "Unknown")
-            risk_event_types = sign_in.get("riskEventTypes", [])
+            risk_level = sign_in.get("riskLevel") or "Unknown"
+            risk_state = sign_in.get("riskState") or "Unknown"
+            created_time = sign_in.get("detectedDateTime", "Unknown")
+            ip_address = sign_in.get("ipAddress") or "Unknown"
+            location = sign_in.get("location") or {}
+            city = location.get("city") or "Unknown"
+            country = location.get("countryOrRegion") or "Unknown"
+            risk_event_type = sign_in.get("riskEventType")
+            risk_event_types = [risk_event_type] if risk_event_type else []
 
             logger.warning(
                 f"User: {user_principal_name} | Risk Level: {risk_level.upper()} | "

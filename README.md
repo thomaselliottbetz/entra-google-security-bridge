@@ -56,9 +56,9 @@ Entra ID (Microsoft Graph API)          Google Workspace (Admin SDK)
 
 **Risky Sign-In Monitoring**
 
-Detects suspicious sign-in patterns by querying Microsoft Identity Protection. Results include user email, risk level (low/medium/high), IP address, geographic location, and the specific risk event types that triggered the alert — for example, `anonymousIP` for VPN/Tor usage or `unfamiliarFeatures` for sign-ins from new locations.
+Detects suspicious sign-in activity by querying Microsoft Entra ID Protection risk detections (`/identityProtection/riskDetections`). Each result is one risk detection and includes the user, risk level (low/medium/high), IP address, geographic location, and the risk event type that triggered it — for example, `anonymizedIPAddress` for anonymizing VPN/Tor use or `newCountry` for activity from a new country. A single sign-in can produce several detections, and offline detections such as `leakedCredentials` may carry no IP address or location. Requires `IdentityRiskEvent.Read.All` and an Entra ID P1/P2 license.
 
-Risk level filtering is applied in Python after retrieval rather than via OData lambda operators. The time-window filter uses indexed `createdDateTime` fields to minimize API latency. Requests carry a timeout and retry on 429/503 responses, honoring `Retry-After` with capped exponential backoff. Full pagination via `@odata.nextLink` ensures no events are missed.
+Risk level filtering is applied in Python after retrieval rather than via OData lambda operators. The time-window filter is applied server-side on `detectedDateTime` (when the risk was detected, which for offline detections can be later than the activity itself), and results are ordered newest first in Python because the endpoint documents `$filter` and `$select` only. Requests carry a timeout and retry on 429/503 responses, honoring `Retry-After` with capped exponential backoff. Full pagination via `@odata.nextLink` ensures no events are missed.
 
 **Guest User Audit (Zero-Trust)**
 

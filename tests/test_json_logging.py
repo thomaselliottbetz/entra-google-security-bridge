@@ -47,14 +47,15 @@ def test_env_var_selects_json_and_text_is_default():
 def test_finding_logs_carry_events(caplog):
     from unittest import mock
     sign_in = {"userPrincipalName": "u@x.com", "riskLevel": "high", "riskState": "atRisk",
-               "createdDateTime": "2026-01-01T00:00:00Z", "ipAddress": "1.2.3.4",
-               "location": {"city": "Seattle", "countryOrRegion": "US"}, "riskEventTypes": ["leakedCredentials"]}
+               "detectedDateTime": "2026-01-01T00:00:00Z", "ipAddress": "1.2.3.4",
+               "location": {"city": "Seattle", "countryOrRegion": "US"}, "riskEventType": "leakedCredentials"}
     resp = mock.Mock(status_code=200); resp.json.return_value = {"value": [sign_in]}
     with mock.patch.object(m, "_get_graph_headers", return_value={}), \
          mock.patch.object(m.requests, "get", return_value=resp), caplog.at_level("WARNING"):
         m.get_risky_sign_ins("t", "c", "s")
     rec = next(r for r in caplog.records if getattr(r, "event", "") == "risky_sign_in")
     assert rec.user == "u@x.com" and rec.risk_level == "high" and rec.country == "US"
+    assert rec.time == "2026-01-01T00:00:00Z" and rec.risk_events == ["leakedCredentials"]
 
 
 def _capture(fmt, fn):
