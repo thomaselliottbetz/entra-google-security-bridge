@@ -336,7 +336,15 @@ Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `messag
 | `oauth_audit_summary` | `users_audited`, `users_total`, `users_failed`, `high_risk`, `medium_risk`, `low_risk` |
 | `ou_sync_summary` | `synced`, `skipped`, `failed` |
 
-This is output designed for ingestion, not a packaged integration: the scripts ship no SIEM connectors, schemas, or dashboards. Logging is configured on import only if the host application has not already configured it; an application with its own logging setup can attach `identity_governance_ms.JsonFormatter` to its handler instead.
+This is output designed for ingestion, not a packaged integration: the scripts ship no SIEM connectors, schemas, or dashboards. Logging is configured on import only if the host application has not already configured it; an application with its own logging setup can reuse the formatter and filters on its handler:
+
+```python
+from identity_governance_ms import JsonFormatter, ModeFilter
+
+handler.setFormatter(JsonFormatter())
+handler.addFilter(ModeFilter("text_only"))   # drop human-readable framing such as "... and N more"
+# For a plain-text handler, use ModeFilter("json_only") instead to keep the 10-token truncation.
+```
 
 **Performance Optimization**
 Complex filtering (e.g., risk level thresholds, domain matching) is applied in Python after retrieval rather than via OData lambda operators, ensuring reliable performance during high-traffic security events. Time-window queries target indexed fields to minimize response times.

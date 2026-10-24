@@ -33,9 +33,9 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
-class _ModeFilter(logging.Filter):
+class ModeFilter(logging.Filter):
     """
-    Drops records flagged for the other output mode.
+    Logging filter that drops records flagged for the other output mode.
 
     Records carry `json_only=True` (complete detail that text output truncates) or
     `text_only=True` (human-readable framing, e.g. "... and N more"). The text handler
@@ -56,14 +56,18 @@ def _configure_logging():
 
     Like logging.basicConfig, this does nothing if the host application has already
     configured logging, so an application's own setup always takes precedence. Applications
-    that want JSON under their own setup can attach JsonFormatter to their handler.
+    using their own handlers should attach the matching ModeFilter as well as, for JSON,
+    JsonFormatter: ModeFilter("text_only") on a JSON handler, ModeFilter("json_only") on a
+    text handler. Without the filter, a JSON handler also receives text-only lines such as
+    "... and N more", and a text handler receives every medium-risk OAuth token instead of
+    the first 10.
     """
     handler = logging.StreamHandler()
     if os.environ.get("BRIDGE_LOG_FORMAT", "text").strip().lower() == "json":
         handler.setFormatter(JsonFormatter())
-        handler.addFilter(_ModeFilter("text_only"))
+        handler.addFilter(ModeFilter("text_only"))
     else:
-        handler.addFilter(_ModeFilter("json_only"))
+        handler.addFilter(ModeFilter("json_only"))
     logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 

@@ -64,9 +64,9 @@ def _capture(fmt, fn):
     h = logging.StreamHandler(buf)
     if fmt == "json":
         h.setFormatter(m.JsonFormatter())
-        h.addFilter(m._ModeFilter("text_only"))
+        h.addFilter(m.ModeFilter("text_only"))
     else:
-        h.addFilter(m._ModeFilter("json_only"))
+        h.addFilter(m.ModeFilter("json_only"))
     root = logging.getLogger()
     old_level = root.level
     root.addHandler(h); root.setLevel(logging.INFO)
