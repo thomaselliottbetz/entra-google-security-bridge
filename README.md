@@ -1,7 +1,7 @@
 # Entra ID & Google Workspace Security Bridge
 
 **Repository:** [thomaselliottbetz/entra-google-security-bridge](https://github.com/thomaselliottbetz/entra-google-security-bridge)
-**Target Environment:** Microsoft Entra ID + Google Workspace (Hybrid Identity)
+**Target Environment:** Microsoft Entra ID + Google Workspace (cross-platform)
 
 ## Table of Contents
 
@@ -13,6 +13,7 @@
 - [Authentication Setup](#authentication-setup)
 - [Required API Permissions](#required-api-permissions)
 - [Usage Examples](#usage-examples)
+- [Testing](#testing)
 - [Production-Ready Considerations](#production-ready-considerations)
 - [Deployment Options](#deployment-options)
 - [Limitations](#limitations)
@@ -44,8 +45,8 @@ Entra ID (Microsoft Graph API)          Google Workspace (Admin SDK)
 │ • User attr query   │              │ • OU management            │
 └─────────────────────┘              └────────────────────────────┘
          │                                        │
-         └──────────── SIEM / SOAR ───────────────┘
-              (Splunk, Sentinel, Google SecOps)
+         └─── JSON logs → log forwarder → SIEM ───┘
+           (e.g., Splunk, Sentinel, Google SecOps)
 ```
 
 ---
@@ -78,7 +79,7 @@ Note: `signInActivity` requires `AuditLog.Read.All` and an Entra ID P1/P2 licens
 
 Queries Entra ID for users whose attributes (e.g., `department`, `officeLocation`) match a given OData filter, then synchronizes their Organizational Unit placement in Google Workspace. Assumes users already exist in Google Workspace, provisioned via SCIM or other means.
 
-Authentication uses MSAL's OAuth 2.0 client credentials flow with automatic token management. The returned user data — `userPrincipalName`, `displayName`, `officeLocation`, `department`, `jobTitle` — drives the OU mapping logic on the Google side.
+Authentication uses MSAL's OAuth 2.0 client credentials flow with automatic token management. The returned user data — `id`, `userPrincipalName`, `displayName`, `mail`, `officeLocation`, `department`, `jobTitle`, `employeeId` — drives the OU mapping logic on the Google side.
 
 **Tech Stack:** OAuth 2.0, Service Accounts, Domain-Wide Delegation
 
@@ -92,7 +93,7 @@ Provides tools for user relocation during role changes or incident response. Inc
 
 **Shadow IT / OAuth Token Audit**
 
-Scans all users for high-risk OAuth grants (e.g., `drive.readonly`, `gmail.send`) and flags applications not on the approved allowlist. The allowlist is matched on exact OAuth client ID, never on display name, since display names are attacker-controlled. Users whose tokens cannot be retrieved are logged at `WARNING` and returned under an `errors` key, so coverage gaps are visible. Each token record includes the application name, granted scopes, and whether the application is anonymous. Results are categorized into high-risk (blocked scopes, not approved), medium-risk (sensitive scopes from unknown apps), and low-risk (approved apps or safe scopes). Full pagination handles organizations with thousands of users.
+Scans all users for high-risk OAuth grants (e.g., `drive.readonly`, `gmail.send`) and flags applications not on the approved allowlist. The allowlist is matched on exact OAuth client ID, never on display name, since display names are attacker-controlled. Users whose tokens cannot be retrieved are logged at `WARNING` and returned under an `errors` key, so coverage gaps are visible. Each token record includes the application name, granted scopes, and whether the application is anonymous. Results are categorized into high-risk (a blocked scope, and the app is not approved), medium-risk (an approved app holding a blocked scope, or an unapproved app with any other scopes), and low-risk (an approved app without blocked scopes, or a token with no scopes). Full pagination handles organizations with thousands of users.
 
 **Tech Stack:** Google Admin SDK, Google Auth Library
 
@@ -302,13 +303,24 @@ for user in result['synced']:
 
 ---
 
+## Testing
+
+The tests mock the Microsoft Graph and Google Admin SDK calls, so no tenant or credentials are needed:
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest tests/
+```
+
+---
+
 ## Production-Ready Considerations
 
 **API Resilience**
 Full pagination via `@odata.nextLink` (Microsoft Graph) and `nextPageToken` (Google Admin SDK) ensures complete result sets in organizations with 10,000+ users.
 
 **Idempotency & Pre-flight Checks**
-Before applying changes, functions verify current state — for example, checking the user's current OU before moving — to prevent blind updates and unnecessary API calls. Users already in the target OU are skipped.
+`move_user_between_ous` verifies the user's current OU matches the expected source before moving, and `sync_entra_to_google_ou` skips users who are already in the target OU or not found in Google Workspace, preventing blind updates and unnecessary API calls. `move_user_to_ou` is the unchecked variant and moves unconditionally.
 
 **Principle of Least Privilege**
 Each function requests only the minimum scopes required. `admin.directory.user.security` is requested separately from general directory access rather than relying on broad Super Admin rights.
@@ -320,7 +332,7 @@ All output uses Python's `logging` module with consistent levels: `INFO` for sta
 BRIDGE_LOG_FORMAT=json python your_script.py 2>> bridge.jsonl
 ```
 
-Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `message`. Each finding additionally carries a stable `event` key and event-specific fields; other status lines do not, so detection rules should filter on `event`. JSON output is complete: every medium-risk OAuth token is emitted as its own event, whereas text output shows only the first 10 followed by a count. Each audit run also emits one `*_summary` event, including when it finds nothing, so a dashboard or alert can detect that a scheduled job has stopped running:
+Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `message`. Each finding additionally carries a stable `event` key and event-specific fields; other status lines do not, so detection rules should filter on `event`. JSON output is complete: every medium-risk OAuth token is emitted as its own event, whereas text output shows only the first 10 followed by a count. Each audit run that completes also emits one `*_summary` event, including when it finds nothing, so a dashboard or alert can detect that a scheduled job has stopped running. A run that fails (for example, on authentication or an API error) logs an `ERROR` and emits no summary, so alert on a missing summary or on `ERROR` records. For example, for a job scheduled hourly, alert when no `risk_detection_summary` arrives within two hours; choose the threshold to fit each job's schedule:
 
 | `event` | Fields |
 |---|---|
@@ -347,7 +359,7 @@ handler.addFilter(ModeFilter("text_only"))   # drop human-readable framing such 
 ```
 
 **Performance Optimization**
-Complex filtering (e.g., risk level thresholds, domain matching) is applied in Python after retrieval rather than via OData lambda operators, ensuring reliable performance during high-traffic security events. Time-window queries target indexed fields to minimize response times.
+Complex filtering (e.g., risk level thresholds, domain matching) is applied in Python after retrieval rather than via OData lambda operators, which keeps behavior predictable on endpoints with limited OData support. Time-window filtering is applied server-side to limit the amount of data transferred.
 
 **Portability**
 The `my_customer` alias and environment-based admin impersonation keep the scripts tenant-agnostic and suitable for multi-region deployment.
@@ -368,7 +380,7 @@ The `my_customer` alias and environment-based admin impersonation keep the scrip
 - **Detection only:** These scripts report findings but do not perform automated remediation (e.g., revoking tokens, disabling accounts). Remediation is expected to be handled by downstream SOAR tooling or manual review.
 - **Not real-time:** Queries are batch-oriented and designed for scheduled execution. For real-time event streaming, consider Microsoft Graph change notifications or Google Cloud Pub/Sub.
 - **Requires existing provisioning:** `sync_entra_to_google_ou` assumes users already exist in Google Workspace. Initial provisioning is out of scope and expected to be handled via SCIM.
-- **Entra ID P1/P2 required:** `signInActivity` (used for guest inactivity checks) is only available on premium tenants. On a non-premium tenant the guest audit is expected to fail with an error (logged) rather than produce results.
+- **Entra ID P1/P2 required:** Both the risk detection API and `signInActivity` (used for guest inactivity checks) require premium licensing. On a non-premium tenant these queries are expected to fail with an error (logged) rather than produce results.
 - **Domain-wide delegation scope:** Broad domain-wide delegation is used for simplicity. In high-sensitivity environments, consider restricting delegation to specific OUs to reduce blast radius.
 
 ---

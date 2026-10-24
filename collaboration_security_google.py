@@ -239,7 +239,7 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
                 )
 
         if medium_risk_tokens:
-            logger.info(f"MEDIUM RISK ({len(medium_risk_tokens)} tokens): These apps have sensitive permissions but may be legitimate.")
+            logger.info(f"MEDIUM RISK ({len(medium_risk_tokens)} tokens): Approved apps holding blocked scopes, or unapproved apps with other scopes.")
             # Text output shows the first 10; JSON output carries every token (json_only).
             for i, token in enumerate(medium_risk_tokens):
                 logger.info(
@@ -258,7 +258,7 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
                 logger.info(f"  ... and {len(medium_risk_tokens) - 10} more", extra={"text_only": True})
 
         if low_risk_tokens:
-            logger.info(f"LOW RISK ({len(low_risk_tokens)} tokens): These are approved apps or have safe permissions.")
+            logger.info(f"LOW RISK ({len(low_risk_tokens)} tokens): Approved apps without blocked scopes, or tokens with no scopes.")
 
         return {
             'high_risk': high_risk_tokens,
@@ -323,7 +323,10 @@ def sync_entra_to_google_ou(
     )
 
     if not entra_users:
-        logger.info("No users found in Entra ID matching criteria")
+        logger.info(
+            "No users found in Entra ID matching criteria",
+            extra={"event": "ou_sync_summary", "synced": 0, "skipped": 0, "failed": 0},
+        )
         return empty_result
 
     creds = service_account.Credentials.from_service_account_file(

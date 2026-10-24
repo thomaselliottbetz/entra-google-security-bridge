@@ -133,3 +133,33 @@ def test_risk_detection_summary_emitted_even_with_zero_findings():
 
     s = next(json.loads(l) for l in _capture("json", run) if '"risk_detection_summary"' in l)
     assert s["findings"] == 0 and s["hours_back"] == 24
+
+
+def test_summary_event_emitted_when_nothing_is_found(caplog):
+    """Every audit emits its *_summary on a completed run, including empty ones."""
+    import collaboration_security_google as g
+    resp = mock.Mock(status_code=200); resp.json.return_value = {"value": []}
+    resp.raise_for_status.return_value = None
+
+    def events():
+        return {getattr(r, "event", None): r for r in caplog.records}
+
+    with mock.patch.object(m, "_get_graph_headers", return_value={}), \
+         mock.patch.object(m.requests, "get", return_value=resp), caplog.at_level("INFO"):
+        m.audit_guest_users("t", "c", "s")
+    assert events()["guest_audit_summary"].guests_total == 0
+
+    caplog.clear()
+    with mock.patch.object(g, "get_entra_users_with_changes", return_value=[]), caplog.at_level("INFO"):
+        g.sync_entra_to_google_ou("t", "c", "s", "creds.json")
+    s = events()["ou_sync_summary"]
+    assert (s.synced, s.skipped, s.failed) == (0, 0, 0)
+
+    caplog.clear()
+    svc = mock.MagicMock()
+    svc.users().list().execute.return_value = {"users": []}
+    with mock.patch.object(g.service_account.Credentials, "from_service_account_file"), \
+         mock.patch.object(g, "_get_admin_email", return_value="a@x.com"), \
+         mock.patch.object(g, "build", return_value=svc), caplog.at_level("INFO"):
+        g.audit_oauth_tokens("creds.json")
+    assert events()["oauth_audit_summary"].users_total == 0

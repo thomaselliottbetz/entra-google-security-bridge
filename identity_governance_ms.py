@@ -399,7 +399,18 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
             page_url = data.get("@odata.nextLink")
 
         if not guest_users:
-            logger.info("No guest users found in the directory.")
+            logger.info(
+                "No guest users found in the directory.",
+                extra={
+                    "event": "guest_audit_summary",
+                    "guests_total": 0,
+                    "days_inactive": days_inactive,
+                    "trusted_active": 0,
+                    "trusted_inactive": 0,
+                    "untrusted_active": 0,
+                    "untrusted_inactive": 0,
+                },
+            )
             return empty_result
 
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_inactive)
