@@ -313,8 +313,25 @@ Before applying changes, functions verify current state — for example, checkin
 **Principle of Least Privilege**
 Each function requests only the minimum scopes required. `admin.directory.user.security` is requested separately from general directory access rather than relying on broad Super Admin rights.
 
-**Leveled Logging**
-All output uses Python's `logging` module with consistent levels: `INFO` for status, `WARNING` for security findings and audit coverage gaps, `ERROR` for failures. Log lines are plain text with `key: value` fields; they can be forwarded to a SIEM/SOAR platform (Splunk, Google SecOps, Microsoft Sentinel) through a log shipper and parsed there, but the scripts do not emit JSON themselves.
+**Logging and SIEM/SOAR Forwarding**
+All output uses Python's `logging` module with consistent levels: `INFO` for status, `WARNING` for security findings and audit coverage gaps, `ERROR` for failures. Output is plain text by default. Setting `BRIDGE_LOG_FORMAT=json` switches to JSON lines (one object per record, on stderr) that a log forwarder can ship to Splunk, Google SecOps, Microsoft Sentinel, or any other SIEM without custom parsing:
+
+```bash
+BRIDGE_LOG_FORMAT=json python your_script.py 2>> bridge.jsonl
+```
+
+Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `message`. Each finding additionally carries a stable `event` key and event-specific fields; summary and status lines do not, so detection rules should filter on `event`:
+
+| `event` | Fields |
+|---|---|
+| `risky_sign_in` | `user`, `risk_level`, `risk_state`, `time`, `ip_address`, `city`, `country`, `risk_events` |
+| `guest_untrusted_inactive`, `guest_untrusted_active` | `user`, `display_name`, `domain`, `last_sign_in`, `created_at` |
+| `oauth_high_risk_token` | `user`, `app_name`, `client_id`, `blocked_scopes`, `anonymous` |
+| `oauth_token_fetch_failed` | `user`, `error` |
+| `oauth_audit_coverage_gap` | `users_audited`, `users_total`, `users_failed` |
+| `ou_sync_failed` | `user`, `target_ou`, `error` |
+
+This is output designed for ingestion, not a packaged integration: the scripts ship no SIEM connectors, schemas, or dashboards. Logging is configured on import only if the host application has not already configured it; an application with its own logging setup can attach `identity_governance_ms.JsonFormatter` to its handler instead.
 
 **Performance Optimization**
 Complex filtering (e.g., risk level thresholds, domain matching) is applied in Python after retrieval rather than via OData lambda operators, ensuring reliable performance during high-traffic security events. Time-window queries target indexed fields to minimize response times.

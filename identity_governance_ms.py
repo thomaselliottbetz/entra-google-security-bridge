@@ -1,11 +1,53 @@
+import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
 import requests
 from msal import ConfidentialClientApplication
 
-logging.basicConfig(level=logging.INFO)
+
+class JsonFormatter(logging.Formatter):
+    """
+    Formats each log record as one JSON object per line, for SIEM/SOAR log forwarders.
+
+    Emits timestamp (UTC, ISO 8601), level, logger, and message, plus any fields passed
+    via logging's `extra=` (findings carry a stable 'event' key and event-specific fields).
+    """
+
+    _STANDARD_ATTRS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
+
+    def format(self, record):
+        payload = {
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        payload.update({k: v for k, v in record.__dict__.items() if k not in self._STANDARD_ATTRS})
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
+def _configure_logging():
+    """
+    Configures root logging: plain text by default, JSON lines when BRIDGE_LOG_FORMAT=json.
+
+    Like logging.basicConfig, this does nothing if the host application has already
+    configured logging, so an application's own setup always takes precedence. Applications
+    that want JSON under their own setup can attach JsonFormatter to their handler.
+    """
+    handlers = None
+    if os.environ.get("BRIDGE_LOG_FORMAT", "text").strip().lower() == "json":
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonFormatter())
+        handlers = [handler]
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
+
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -102,6 +144,17 @@ def _last_activity(guest):
     ]
     times = [t for t in times if t]
     return max(times) if times else None
+
+
+def _guest_log_fields(guest):
+    """Structured fields for a guest finding (see JsonFormatter)."""
+    return {
+        "user": guest["email"],
+        "display_name": guest["display_name"],
+        "domain": guest["domain"],
+        "last_sign_in": guest["last_sign_in"],
+        "created_at": guest["created"],
+    }
 
 
 def _guest_home_domain(guest):
@@ -207,7 +260,18 @@ def get_risky_sign_ins(tenant_id, client_id, client_secret, hours_back=24, min_r
                 f"User: {user_principal_name} | Risk Level: {risk_level.upper()} | "
                 f"Risk State: {risk_state} | Time: {created_time} | "
                 f"IP: {ip_address} | Location: {city}, {country} | "
-                f"Risk Events: {', '.join(risk_event_types) if risk_event_types else 'None'}"
+                f"Risk Events: {', '.join(risk_event_types) if risk_event_types else 'None'}",
+                extra={
+                    "event": "risky_sign_in",
+                    "user": user_principal_name,
+                    "risk_level": risk_level,
+                    "risk_state": risk_state,
+                    "time": created_time,
+                    "ip_address": ip_address,
+                    "city": city,
+                    "country": country,
+                    "risk_events": risk_event_types,
+                },
             )
 
         return filtered_sign_ins
@@ -353,7 +417,8 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
                 logger.warning(
                     f"  {guest['email']} ({guest['display_name']}) | "
                     f"Domain: {guest['domain']} | Last sign-in: {guest['last_sign_in']} | "
-                    f"Created: {guest['created']}"
+                    f"Created: {guest['created']}",
+                    extra={"event": "guest_untrusted_inactive", **_guest_log_fields(guest)},
                 )
 
         if untrusted_active:
@@ -361,7 +426,8 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
             for guest in untrusted_active:
                 logger.warning(
                     f"  {guest['email']} ({guest['display_name']}) | "
-                    f"Domain: {guest['domain']} | Last sign-in: {guest['last_sign_in']}"
+                    f"Domain: {guest['domain']} | Last sign-in: {guest['last_sign_in']}",
+                    extra={"event": "guest_untrusted_active", **_guest_log_fields(guest)},
                 )
 
         if trusted_inactive:

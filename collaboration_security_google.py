@@ -3,9 +3,8 @@ import os
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from identity_governance_ms import get_entra_users_with_changes
+from identity_governance_ms import get_entra_users_with_changes  # also configures logging
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -190,7 +189,10 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
                         low_risk_tokens.append(token_info)
 
             except Exception as e:
-                logger.warning(f"Could not retrieve tokens for {user_email}; user not audited: {e}")
+                logger.warning(
+                    f"Could not retrieve tokens for {user_email}; user not audited: {e}",
+                    extra={"event": "oauth_token_fetch_failed", "user": user_email, "error": str(e)},
+                )
                 errors.append({'user': user_email, 'error': str(e)})
                 continue
 
@@ -199,16 +201,31 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
         if errors:
             logger.warning(
                 f"COVERAGE GAP: audited {audited} of {audited + len(errors)} users; "
-                f"{len(errors)} could not be audited."
+                f"{len(errors)} could not be audited.",
+                extra={
+                    "event": "oauth_audit_coverage_gap",
+                    "users_audited": audited,
+                    "users_total": audited + len(errors),
+                    "users_failed": len(errors),
+                },
             )
 
         if high_risk_tokens:
             logger.warning(f"HIGH RISK ({len(high_risk_tokens)} tokens): These apps have blocked scopes and are not approved.")
             for token in high_risk_tokens:
-                logger.warning(f"  User: {token['user']} | App: {token['app_name']} | Client ID: {token['client_id']}")
-                logger.warning(f"  Blocked Scopes: {[s for s in token['scopes'] if s in blocked_scopes]}")
-                if token['anonymous']:
-                    logger.warning(f"  Anonymous application")
+                token_blocked = [s for s in token['scopes'] if s in blocked_scopes]
+                logger.warning(
+                    f"  User: {token['user']} | App: {token['app_name']} | Client ID: {token['client_id']} | "
+                    f"Blocked Scopes: {token_blocked}" + (" | Anonymous application" if token['anonymous'] else ""),
+                    extra={
+                        "event": "oauth_high_risk_token",
+                        "user": token['user'],
+                        "app_name": token['app_name'],
+                        "client_id": token['client_id'],
+                        "blocked_scopes": token_blocked,
+                        "anonymous": token['anonymous'],
+                    },
+                )
 
         if medium_risk_tokens:
             logger.info(f"MEDIUM RISK ({len(medium_risk_tokens)} tokens): These apps have sensitive permissions but may be legitimate.")
@@ -351,7 +368,10 @@ def sync_entra_to_google_ou(
             })
             logger.info(f"Synced {google_email} from {current_ou} to {target_ou} (matched on {matched_attr}={matched_value})")
         except Exception as e:
-            logger.error(f"Failed to sync {google_email} to {target_ou}: {e}")
+            logger.error(
+                f"Failed to sync {google_email} to {target_ou}: {e}",
+                extra={"event": "ou_sync_failed", "user": google_email, "target_ou": target_ou, "error": str(e)},
+            )
             failed_users.append({'email': google_email, 'target_ou': target_ou, 'error': str(e)})
 
     logger.info(
