@@ -4,7 +4,7 @@ import os
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from identity_governance_ms import get_entra_users_with_changes
+from identity_governance_ms import build_user_filter, get_entra_users_with_changes
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,10 @@ def _get_admin_email():
     if not admin_email:
         raise ValueError("GOOGLE_ADMIN_EMAIL environment variable must be set")
     return admin_email
+
+
+class OUMismatchError(ValueError):
+    """The user is not in the OU the caller expected; nothing was changed."""
 
 
 def move_user_to_ou(user_email, target_ou_path, credentials_path, dry_run=False):
@@ -93,7 +97,8 @@ def move_user_between_ous(user_email, source_org_unit_path, target_org_unit_path
                  mismatch still raises, so a dry run shows what a real run would refuse.
 
     Raises:
-        ValueError: If the user's current OU differs from source_org_unit_path.
+        OUMismatchError: (a ValueError) If the user's current OU differs from source_org_unit_path.
+                         It is not logged as an error.
 
     Note: Requires service account with domain-wide delegation and GOOGLE_ADMIN_EMAIL environment variable.
     """
@@ -108,7 +113,7 @@ def move_user_between_ous(user_email, source_org_unit_path, target_org_unit_path
         user = service.users().get(userKey=user_email).execute(num_retries=_API_RETRIES)
         current_ou = user.get('orgUnitPath', '')
         if current_ou != source_org_unit_path:
-            raise ValueError(
+            raise OUMismatchError(
                 f"User {user_email} is in '{current_ou}', not expected '{source_org_unit_path}'; not moved."
             )
 
@@ -118,6 +123,8 @@ def move_user_between_ous(user_email, source_org_unit_path, target_org_unit_path
 
         service.users().update(userKey=user_email, body={"orgUnitPath": target_org_unit_path}).execute(num_retries=_API_RETRIES)
         logger.info(f"User {user_email} moved to {target_org_unit_path}.")
+    except OUMismatchError:
+        raise  # a refused pre-flight is the guard working; the caller gets the message, not an ERROR log
     except Exception as e:
         logger.error(f"Error moving user: {e}")
         raise
@@ -321,6 +328,42 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
         }
 
 
+def ou_mapping_filter(ou_mapping):
+    """
+    Builds the Entra $filter that selects exactly the users an ou_mapping can place.
+
+    One clause per mapped attribute value, joined with 'or', so every user returned matches
+    some mapping key. Attributes must be ones build_user_filter accepts; Graph compares
+    strings case-insensitively, which sync_entra_to_google_ou mirrors when it matches.
+
+    Raises:
+        ValueError: If the mapping is empty or names an attribute that cannot be filtered on.
+    """
+    if not ou_mapping:
+        raise ValueError("ou_mapping is empty")
+    return " or ".join(
+        build_user_filter(attribute, list(value_map))
+        for attribute, value_map in ou_mapping.items()
+    )
+
+
+def _casefolded_mapping(ou_mapping):
+    """Returns {attribute: {value.casefold(): (value, ou)}}; rejects keys that differ only by case."""
+    folded = {}
+    for attribute, value_map in ou_mapping.items():
+        entries = {}
+        for value, ou in value_map.items():
+            key = str(value).casefold()
+            if key in entries:
+                raise ValueError(
+                    f"ou_mapping[{attribute!r}] has keys that differ only by case: "
+                    f"{entries[key][0]!r} and {value!r}"
+                )
+            entries[key] = (value, ou)
+        folded[attribute] = entries
+    return folded
+
+
 def sync_entra_to_google_ou(
     entra_tenant_id,
     entra_client_id,
@@ -346,7 +389,10 @@ def sync_entra_to_google_ou(
         ou_mapping: Dict mapping Entra attributes to OU paths, e.g.:
                    {"officeLocation": {"Seattle": "/Engineering/Seattle", "NYC": "/Engineering/NYC"}}
                    or {"department": {"Engineering": "/Engineering"}}
-        filter_criteria: OData filter for Entra ID query (optional)
+        filter_criteria: OData filter for Entra ID query (optional). When omitted, it is
+                         derived from ou_mapping (see ou_mapping_filter), so every user returned
+                         matches some mapping key. Mapping values are matched case-insensitively,
+                         like Graph's eq.
         email_domain_mapping: Optional dict mapping Entra email domains to Google domains,
                              e.g., {"@company.com": "@company.google.com"}
         dry_run: If True, look users up and work out every move but change nothing. Moves that
@@ -359,7 +405,7 @@ def sync_entra_to_google_ou(
         'skipped' and 'unmapped' and 'unchanged' contain email lists; 'failed' contains error
         details. Each Entra user with a userPrincipalName lands in exactly one bucket: 'unmapped'
         users exist in Google but match no ou_mapping rule, 'unchanged' users are already in
-        their target OU. 'skipped' holds only users Google reports as
+        their target OU (logged as a WARNING, event ou_sync_unmapped, because it means the filter and mapping disagree). 'skipped' holds only users Google reports as
         not found (HTTP 404); any other lookup error (403, 429 after retries, 5xx, network) is
         recorded in 'failed' with target_ou None, since the user's state is unknown.
     """
@@ -372,6 +418,10 @@ def sync_entra_to_google_ou(
                 "NYC": "/Engineering/NYC"
             }
         }
+
+    folded_mapping = _casefolded_mapping(ou_mapping)
+    if filter_criteria is None:
+        filter_criteria = ou_mapping_filter(ou_mapping)
 
     entra_users = get_entra_users_with_changes(
         tenant_id=entra_tenant_id,
@@ -422,8 +472,8 @@ def sync_entra_to_google_ou(
         try:
             google_user = service.users().get(userKey=google_email).execute(num_retries=_API_RETRIES)
             current_ou = google_user.get('orgUnitPath', '/')
-        except HttpError as e:
-            if e.resp.status == 404:
+        except Exception as e:
+            if isinstance(e, HttpError) and e.resp.status == 404:
                 logger.debug(f"User {google_email} not found in Google Workspace, skipping: {e}")
                 skipped_users.append(google_email)
             else:
@@ -433,22 +483,16 @@ def sync_entra_to_google_ou(
                 )
                 failed_users.append({'email': google_email, 'target_ou': None, 'error': str(e)})
             continue
-        except Exception as e:
-            logger.error(
-                f"Could not look up {google_email} in Google Workspace: {e}",
-                extra={"event": "ou_sync_failed", "user": google_email, "target_ou": None, "error": str(e)},
-            )
-            failed_users.append({'email': google_email, 'target_ou': None, 'error': str(e)})
-            continue
 
         target_ou = None
         matched_attr = None
         matched_value = None
 
-        for attr_name, value_map in ou_mapping.items():
-            user_value = user.get(attr_name, '')
-            if user_value and user_value in value_map:
-                target_ou = value_map[user_value]
+        for attr_name, entries in folded_mapping.items():
+            user_value = user.get(attr_name) or ''
+            match = entries.get(str(user_value).casefold()) if user_value else None
+            if match:
+                target_ou = match[1]
                 matched_attr = attr_name
                 matched_value = user_value
                 break
@@ -483,13 +527,7 @@ def sync_entra_to_google_ou(
 
         try:
             service.users().update(userKey=google_email, body={"orgUnitPath": target_ou}).execute(num_retries=_API_RETRIES)
-            synced_users.append({
-                'email': google_email,
-                'source_attr': matched_attr,
-                'source_value': matched_value,
-                'target_ou': target_ou,
-                'previous_ou': current_ou
-            })
+            synced_users.append(move)
             logger.info(f"Synced {google_email} from {current_ou} to {target_ou} (matched on {matched_attr}={matched_value})")
         except Exception as e:
             logger.error(
@@ -515,7 +553,17 @@ def sync_entra_to_google_ou(
     )
 
     if skipped_users:
-        logger.info(f"Skipped users (not found in Google Workspace): {len(skipped_users)}")
+        logger.warning(
+            f"{len(skipped_users)} users matched in Entra ID but were not found in Google Workspace "
+            f"(not provisioned, deprovisioned on one side, or email_domain_mapping is wrong)"
+        )
+
+    if unmapped_users:
+        logger.warning(
+            f"{len(unmapped_users)} users matched the filter but no ou_mapping rule; the filter and "
+            f"mapping disagree (omit filter_criteria to derive the filter from the mapping)",
+            extra={"event": "ou_sync_unmapped", "count": len(unmapped_users)},
+        )
 
     if failed_users:
         logger.warning(f"Failed to sync {len(failed_users)} users")

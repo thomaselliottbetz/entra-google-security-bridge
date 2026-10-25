@@ -28,5 +28,7 @@ def test_filter_is_sent_as_param_not_interpolated():
     assert first.args[0] == "https://graph.microsoft.com/v1.0/users"
     assert first.kwargs["params"]["$filter"] == tricky
     assert "$select" in first.kwargs["params"]
+    assert first.kwargs["params"]["$count"] == "true"
+    assert first.kwargs["headers"]["ConsistencyLevel"] == "eventual"
     assert second.args[0] == next_link
     assert second.kwargs["params"] is None

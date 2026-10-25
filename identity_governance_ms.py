@@ -615,8 +615,12 @@ def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_cri
     graph_url = "https://graph.microsoft.com/v1.0/users"
     params = {
         "$filter": filter_criteria,
-        "$select": "id,userPrincipalName,displayName,mail,officeLocation,department,jobTitle,employeeId"
+        "$select": "id,userPrincipalName,displayName,mail,officeLocation,department,jobTitle,employeeId",
+        # Microsoft documents eq on officeLocation and companyName as supported only with
+        # advanced query parameters; they are harmless on properties that work without them.
+        "$count": "true",
     }
+    headers = {**headers, "ConsistencyLevel": "eventual"}
 
     try:
         all_users = []

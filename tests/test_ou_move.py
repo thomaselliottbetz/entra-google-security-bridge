@@ -117,3 +117,17 @@ def test_move_calls_retry_transient_errors():
     svc, _, _, _ = _run(g.move_user_between_ous, "u@example.com", "/Eng", "/Eng/A", "creds.json")
     svc.users().get().execute.assert_called_with(num_retries=g._API_RETRIES)
     svc.users().update().execute.assert_called_with(num_retries=g._API_RETRIES)
+
+
+def test_refused_preflight_is_not_logged_as_an_error(caplog):
+    with caplog.at_level("INFO"):
+        _, error = _move("/Sales")
+    assert isinstance(error, g.OUMismatchError) and isinstance(error, ValueError)
+    assert [r for r in caplog.records if r.levelname == "ERROR"] == []
+
+
+def test_api_failure_during_preflight_is_logged_once(caplog):
+    boom = RuntimeError("500 backend")
+    with caplog.at_level("INFO"):
+        _run(g.move_user_between_ous, "u@example.com", "/Eng", "/Eng/A", "creds.json", update_error=boom)
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1

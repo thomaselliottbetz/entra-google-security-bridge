@@ -174,3 +174,56 @@ def test_main_configures_logging_before_running(env, monkeypatch):
     with mock.patch.object(m, "get_risk_detections", side_effect=lambda *a, **k: calls.append("run") or []):
         cli.main(["risk-detections"])
     assert calls == ["configure", "run"]
+
+
+def _sync_result(**kw):
+    base = {"synced": [], "skipped": [], "failed": [], "unmapped": [], "unchanged": [], "would_sync": []}
+    return {**base, **kw}
+
+
+def test_ou_sync_dry_run_drift_is_a_finding(env, tmp_path):
+    env(ENTRA_ENV, GOOGLE_ENV)
+    drift = _sync_result(would_sync=[{"email": "a@example.com"}])
+    with mock.patch.object(g, "sync_entra_to_google_ou", return_value=drift):
+        assert cli.main(_sync_args(tmp_path)) == cli.EXIT_OK
+        assert cli.main(_sync_args(tmp_path, "--fail-on-findings")) == cli.EXIT_FINDINGS
+    with mock.patch.object(g, "sync_entra_to_google_ou", return_value=_sync_result()):
+        assert cli.main(_sync_args(tmp_path, "--fail-on-findings")) == cli.EXIT_OK
+
+
+def test_ou_sync_apply_reports_no_findings_but_failures_still_fail(env, tmp_path):
+    env(ENTRA_ENV, GOOGLE_ENV)
+    moved = _sync_result(synced=[{"email": "a@example.com"}])
+    with mock.patch.object(g, "sync_entra_to_google_ou", return_value=moved):
+        assert cli.main(_sync_args(tmp_path, "--apply", "--fail-on-findings")) == cli.EXIT_OK
+    failed = _sync_result(failed=[{"email": "a", "target_ou": "/x", "error": "e"}],
+                          would_sync=[{"email": "b"}])
+    with mock.patch.object(g, "sync_entra_to_google_ou", return_value=failed):
+        assert cli.main(_sync_args(tmp_path, "--fail-on-findings")) == cli.EXIT_FAILED
+
+
+def test_ou_sync_skipped_users_are_findings_in_both_modes(env, tmp_path):
+    env(ENTRA_ENV, GOOGLE_ENV)
+    missing = _sync_result(skipped=["gone@example.com"])
+    with mock.patch.object(g, "sync_entra_to_google_ou", return_value=missing):
+        assert cli.main(_sync_args(tmp_path, "--fail-on-findings")) == cli.EXIT_FINDINGS
+        assert cli.main(_sync_args(tmp_path, "--apply", "--fail-on-findings")) == cli.EXIT_FINDINGS
+
+
+def test_ou_sync_filter_is_derived_from_the_mapping_when_omitted(env, tmp_path):
+    env(ENTRA_ENV, GOOGLE_ENV)
+    mapping = tmp_path / "mapping.json"
+    mapping.write_text(json.dumps({"officeLocation": {"Seattle": "/S", "NYC": "/N"}}))
+    with mock.patch.object(g, "sync_entra_to_google_ou", return_value=_sync_result()) as f:
+        assert cli.main(["ou-sync", "--ou-mapping-file", str(mapping)]) == cli.EXIT_OK
+    assert f.call_args.kwargs["filter_criteria"] == "officeLocation eq 'Seattle' or officeLocation eq 'NYC'"
+
+
+def test_ou_sync_underivable_filter_is_a_usage_error(env, tmp_path):
+    env(ENTRA_ENV, GOOGLE_ENV)
+    mapping = tmp_path / "mapping.json"
+    mapping.write_text(json.dumps({"userType": {"Guest": "/G"}}))
+    with mock.patch.object(g, "sync_entra_to_google_ou") as f, pytest.raises(SystemExit) as exc:
+        cli.main(["ou-sync", "--ou-mapping-file", str(mapping)])
+    assert exc.value.code == cli.EXIT_USAGE
+    f.assert_not_called()

@@ -77,7 +77,7 @@ Note: `signInActivity` requires `AuditLog.Read.All` and an Entra ID P1/P2 licens
 
 **Attribute-Based OU Sync**
 
-Queries Entra ID for users whose attributes (e.g., `department`, `officeLocation`) match a given OData filter, then synchronizes their Organizational Unit placement in Google Workspace. Assumes users already exist in Google Workspace, provisioned via SCIM or other means.
+Queries Entra ID for users whose attributes (e.g., `department`, `officeLocation`) match a given OData filter, then synchronizes their Organizational Unit placement in Google Workspace. Assumes users already exist in Google Workspace, provisioned via SCIM or other means. Mapping values are matched case-insensitively, like Graph's `eq`, and when no filter is given it is derived from the mapping. The sync only sees users who currently match the filter (see Limitations for what that leaves out).
 
 Authentication uses MSAL's OAuth 2.0 client credentials flow with automatic token management. The returned user data — `id`, `userPrincipalName`, `displayName`, `mail`, `officeLocation`, `department`, `jobTitle`, `employeeId` — drives the OU mapping logic on the Google side.
 
@@ -345,7 +345,7 @@ python -m pytest tests/
 Full pagination via `@odata.nextLink` (Microsoft Graph) and `nextPageToken` (Google Admin SDK) ensures complete result sets in organizations with 10,000+ users (completeness, not speed; see the OAuth audit scale limitation below). Every Google Admin SDK call, reads and OU updates alike, retries up to three times on 429 and 5xx responses; OU updates set an absolute value, so a repeat is safe. Microsoft Graph calls retry on 429 and 503 as described above.
 
 **Idempotency & Pre-flight Checks**
-`move_user_between_ous` refuses to move a user whose current OU differs from the expected source (the check and the update are separate calls, so it is not atomic), and `sync_entra_to_google_ou` skips users who are already in the target OU or not found in Google Workspace (HTTP 404 only; other lookup errors are reported as failed), preventing blind updates and unnecessary API calls. `move_user_to_ou` is the unchecked variant and moves unconditionally.
+`move_user_between_ous` refuses to move a user whose current OU differs from the expected source, raising `OUMismatchError` (a `ValueError`) without logging an error (the check and the update are separate calls, so it is not atomic), and `sync_entra_to_google_ou` skips users who are already in the target OU or not found in Google Workspace (HTTP 404 only; other lookup errors are reported as failed), preventing blind updates and unnecessary API calls. `move_user_to_ou` is the unchecked variant and moves unconditionally.
 
 **Principle of Least Privilege**
 Each function requests only the minimum OAuth scopes it needs, and `admin.directory.user.security` is requested separately from general directory access. The enforced limit is the scope list authorized for the service account in the Admin console, not what the code requests, so separate service accounts for auditing and for moves are recommended (see [Note on OAuth Scopes](#note-on-oauth-scopes)).
@@ -369,6 +369,7 @@ Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `messag
 | `oauth_audit_failed` | `error` |
 | `oauth_audit_coverage_gap` | `users_audited`, `users_total`, `users_failed` |
 | `cli_failed` | `command` (`bridge_cli.py` only: the command raised an unexpected exception) |
+| `ou_sync_unmapped` | `count` (users matched the filter but no `ou_mapping` rule) |
 | `ou_sync_would_move` | `user`, `source_attr`, `source_value`, `target_ou`, `previous_ou` (dry run only) |
 | `ou_sync_failed` | `user`, `target_ou`, `error` |
 | `risk_detection_summary` | `findings`, `hours_back`, `min_risk_level` |
@@ -410,7 +411,7 @@ python bridge_cli.py ou-sync --ou-mapping-file mapping.json --filter "officeLoca
 python bridge_cli.py ou-sync --ou-mapping-file mapping.json --filter "officeLocation eq 'Seattle'" --apply  # writes
 ```
 
-Secrets are read from the environment, never from arguments, which are visible in process listings. Findings are written as log records (see Logging and SIEM/SOAR Forwarding under Production-Ready Considerations). `ou-sync` is a dry run unless `--apply` is given, and requires an explicit `--ou-mapping-file` and `--filter` rather than the library's example defaults. Subcommand options are listed with `--help`. `oauth-audit` extends the default blocked scopes with `--extra-blocked-scope`; the file form of the allowlist is one client ID per line, with `#` comments.
+Secrets are read from the environment, never from arguments, which are visible in process listings. Findings are written as log records (see Logging and SIEM/SOAR Forwarding under Production-Ready Considerations). `ou-sync` is a dry run unless `--apply` is given, and requires an explicit `--ou-mapping-file` rather than the library's example defaults. Without `--filter`, the Entra filter is derived from the mapping, so every user returned matches a mapping key; `--filter` overrides it. Subcommand options are listed with `--help`. `oauth-audit` extends the default blocked scopes with `--extra-blocked-scope`; the file form of the allowlist is one client ID per line, with `#` comments.
 
 Exit codes let a scheduler tell the cases apart:
 
@@ -421,7 +422,7 @@ Exit codes let a scheduler tell the cases apart:
 | 2 | Usage or configuration error (missing setting, unreadable file). |
 | 3 | The run failed or was incomplete: an `ERROR` was logged (for example an authentication failure), users could not be audited, or a sync update failed. Takes precedence over 1. |
 
-Exit 3 matters because the library functions return empty results on failure; the CLI treats a logged `ERROR` as a failed run instead of a clean one. For `risk-detections` and `guest-audit`, findings are all returned detections and all guests except trusted-active; for `oauth-audit`, high-risk tokens.
+Exit 3 matters because the library functions return empty results on failure; the CLI treats a logged `ERROR` as a failed run instead of a clean one. For `risk-detections` and `guest-audit`, findings are all returned detections and all guests except trusted-active; for `oauth-audit`, high-risk tokens; for `ou-sync`, users whose Google OU differs from the one Entra implies (`would_sync`, dry run only) plus users who match in Entra but do not exist in Google (`skipped`), so a scheduled `ou-sync --fail-on-findings` works as a drift detector. An `ou-sync --apply` run corrects its moves, so only `skipped` users count. The `skipped` count recurs every run if some Entra users legitimately have no Workspace account (contractors, for example); narrow the mapping or filter so those users are not selected, since there is no exclusion list. Users that match the filter but no mapping rule (`unmapped`) are logged as a `WARNING` and do not change the exit code; with the derived filter the bucket should stay empty.
 
 Other ways to run it:
 
@@ -436,6 +437,8 @@ Other ways to run it:
 
 - **Detection only:** These scripts report findings but do not perform automated remediation (e.g., revoking tokens, disabling accounts). Remediation is expected to be handled by downstream SOAR tooling or manual review.
 - **Not real-time:** Queries are batch-oriented and designed for scheduled execution. For real-time event streaming, consider Microsoft Graph change notifications or Google Cloud Pub/Sub.
+- **Entra user query uses advanced query parameters:** `get_entra_users_with_changes` sends `ConsistencyLevel: eventual` and `$count=true`. Microsoft's table of filterable user properties lists `eq` on `officeLocation` and `companyName` as supported only with these, and says they are harmless on properties that work without them. The cost is eventual consistency: a just-changed attribute can take a short while to show in results. This was taken from Microsoft's documentation and has not been run against a tenant.
+- **Sync only sees current matches:** `sync_entra_to_google_ou` starts from Entra users who currently match the filter. A user whose attribute changes away from every mapped value (for example, `officeLocation` from `Seattle` to `Remote`) drops out of the query and stays in their old Google OU, undetected. Catching that would need a second pass starting from Google: list the users in each mapped OU, check each against their current Entra attributes, and flag those that no longer map there. That pass is not implemented.
 - **Requires existing provisioning:** `sync_entra_to_google_ou` assumes users already exist in Google Workspace. Initial provisioning is out of scope and expected to be handled via SCIM.
 - **Entra ID P1/P2 required:** Both the risk detection API and `signInActivity` (used for guest inactivity checks) require premium licensing. On a non-premium tenant these queries are expected to fail with an error (logged) rather than produce results.
 - **OAuth audit scale:** `audit_oauth_tokens` calls `tokens.list` once per user, serially, so run time grows with the number of users and can be long in organizations with tens of thousands of them (not benchmarked); a user whose call fails after retries is reported under `errors`, not skipped silently. The usual way to scale this is the Admin SDK Reports API, where `activities.list` with `applicationName=token` returns OAuth token events (`authorize`, `revoke`, `request`, `deny`, `activity`) for all users in pages, with `client_id`, `app_name` and `scope` on each event. That is an event log, not a snapshot of the grants that exist today. The documented default window is the most recent 180 days, so an older grant appears only if it has an event inside the window, and it needs the separate `admin.reports.audit.readonly` scope. It would suit continuous monitoring of new grants, and `tokens.list` remains the way to inventory current ones. Neither the Reports path nor any parallelism of the per-user calls is implemented here.

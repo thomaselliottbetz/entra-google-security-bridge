@@ -208,3 +208,68 @@ def test_sync_dry_run_emits_events_and_flags_summary(caplog):
     assert by_event["ou_sync_would_move"].target_ou == "/Engineering/Seattle"
     summary = by_event["ou_sync_summary"]
     assert (summary.dry_run, summary.would_sync, summary.synced) == (True, 1, 0)
+
+
+def test_ou_mapping_filter_covers_every_mapped_value_and_attribute():
+    assert g.ou_mapping_filter({"officeLocation": {"Seattle": "/S", "NYC": "/N"}}) == \
+        "officeLocation eq 'Seattle' or officeLocation eq 'NYC'"
+    assert g.ou_mapping_filter({"officeLocation": {"Seattle": "/S"}, "department": {"R&D": "/R"}}) == \
+        "officeLocation eq 'Seattle' or department eq 'R&D'"
+
+
+@pytest.mark.parametrize("mapping", [{}, {"userType": {"Guest": "/G"}}, {"department": {}}])
+def test_ou_mapping_filter_rejects_unusable_mappings(mapping):
+    with pytest.raises(ValueError):
+        g.ou_mapping_filter(mapping)
+
+
+def test_sync_matches_mapping_values_case_insensitively():
+    user = {"userPrincipalName": "a@example.com", "officeLocation": "seattle"}
+    result, svc, _ = _sync_run([user], {"a@example.com": "/Sales"})
+    assert result["unmapped"] == []
+    assert result["synced"][0]["target_ou"] == "/Engineering/Seattle"
+    assert result["synced"][0]["source_value"] == "seattle"  # the user's actual value is reported
+
+
+def test_mapping_keys_differing_only_by_case_are_rejected():
+    with mock.patch.object(g, "get_entra_users_with_changes") as entra, \
+         pytest.raises(ValueError, match="differ only by case"):
+        g.sync_entra_to_google_ou(
+            "t", "c", "s", "creds.json",
+            ou_mapping={"officeLocation": {"Seattle": "/A", "seattle": "/B"}})
+    entra.assert_not_called()
+
+
+def test_sync_derives_the_filter_from_the_mapping_when_none_is_given():
+    mapping = {"officeLocation": {"Seattle": "/S", "NYC": "/N"}}
+    with mock.patch.object(g, "get_entra_users_with_changes", return_value=[]) as entra:
+        g.sync_entra_to_google_ou("t", "c", "s", "creds.json", ou_mapping=mapping)
+        assert entra.call_args.kwargs["filter_criteria"] == \
+            "officeLocation eq 'Seattle' or officeLocation eq 'NYC'"
+        g.sync_entra_to_google_ou("t", "c", "s", "creds.json", ou_mapping=mapping, filter_criteria="x eq 'y'")
+        assert entra.call_args.kwargs["filter_criteria"] == "x eq 'y'"
+
+
+def test_unmapped_and_skipped_users_log_warnings(caplog):
+    entra = [{"userPrincipalName": "nomap@example.com", "officeLocation": "Paris"},
+             _seattle("gone@example.com")]
+    svc = mock.MagicMock()
+
+    def get(userKey):
+        req = mock.Mock()
+        if userKey == "gone@example.com":
+            req.execute.side_effect = _http_error(404)
+        else:
+            req.execute.return_value = {"orgUnitPath": "/Sales"}
+        return req
+
+    svc.users().get.side_effect = get
+    with mock.patch.object(g, "get_entra_users_with_changes", return_value=entra), \
+         mock.patch.object(g.service_account.Credentials, "from_service_account_file"), \
+         mock.patch.object(g, "_get_admin_email", return_value="admin@example.com"), \
+         mock.patch.object(g, "build", return_value=svc), \
+         caplog.at_level("WARNING"):
+        g.sync_entra_to_google_ou("t", "c", "s", "creds.json")
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(getattr(r, "event", "") == "ou_sync_unmapped" and r.count == 1 for r in warnings)
+    assert any("not found in Google Workspace" in r.getMessage() for r in warnings)

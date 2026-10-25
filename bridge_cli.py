@@ -5,7 +5,7 @@ Command-line entry point for scheduled runs (cron, Task Scheduler, CI).
     python bridge_cli.py risk-detections --hours-back 24 --min-risk-level medium
     python bridge_cli.py guest-audit --trusted-domain partner.com --days-inactive 90
     python bridge_cli.py oauth-audit --approved-apps-file approved_apps.txt
-    python bridge_cli.py ou-sync --ou-mapping-file mapping.json --filter "officeLocation eq 'Seattle'"
+    python bridge_cli.py ou-sync --ou-mapping-file mapping.json
 
 Secrets are read from the environment, never from arguments (which are visible in process
 listings): ENTRA_TENANT_ID, ENTRA_CLIENT_ID, ENTRA_CLIENT_SECRET for Entra commands;
@@ -120,10 +120,21 @@ def _cmd_ou_sync(args):
     mapping = _read_json(args.ou_mapping_file)
     import collaboration_security_google as google
 
+    filter_criteria = args.filter
+    if filter_criteria is None:
+        try:
+            filter_criteria = google.ou_mapping_filter(mapping)
+        except (ValueError, AttributeError, TypeError) as e:
+            raise UsageError(f"cannot derive a filter from {args.ou_mapping_file}: {e}")
+
     result = google.sync_entra_to_google_ou(
-        *entra, credentials_path, ou_mapping=mapping, filter_criteria=args.filter,
+        *entra, credentials_path, ou_mapping=mapping, filter_criteria=filter_criteria,
         email_domain_mapping=_domain_map(args.email_domain_map), dry_run=not args.apply)
-    return 0, bool(result["failed"])
+    # Findings are what a person has to look at. A dry run's planned moves are drift (Google
+    # disagrees with Entra); an --apply run has already corrected its moves. Users matched in
+    # Entra but missing from Google are never fixed by the sync, so they count either way.
+    findings = len(result["skipped"]) + (0 if args.apply else len(result["would_sync"]))
+    return findings, bool(result["failed"])
 
 
 def build_parser():
@@ -157,7 +168,8 @@ def build_parser():
     p = sub.add_parser("ou-sync", parents=[common], help="Sync Entra attributes to Google OUs (dry run unless --apply)")
     p.add_argument("--ou-mapping-file", required=True, metavar="PATH",
                    help='JSON such as {"officeLocation": {"Seattle": "/Engineering/Seattle"}}')
-    p.add_argument("--filter", required=True, help="OData $filter for the Entra user query")
+    p.add_argument("--filter", help="OData $filter for the Entra user query (default: derived from "
+                                    "the mapping, so every user returned matches a mapping key)")
     p.add_argument("--email-domain-map", action="append", metavar="FROM=TO",
                    help="repeatable; e.g. @company.com=@company.google.com")
     p.add_argument("--apply", action="store_true", help="make the changes; without it nothing is written")
