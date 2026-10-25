@@ -79,7 +79,7 @@ Note: `signInActivity` requires `AuditLog.Read.All` and an Entra ID P1/P2 licens
 
 Queries Entra ID for users whose attributes (e.g., `department`, `officeLocation`) match a given OData filter, then synchronizes their Organizational Unit placement in Google Workspace. Assumes users already exist in Google Workspace, provisioned via SCIM or other means. Mapping values are matched case-insensitively, like Graph's `eq`, and when no filter is given it is derived from the mapping. The sync only sees users who currently match the filter (see Limitations for what that leaves out).
 
-Authentication uses MSAL's OAuth 2.0 client credentials flow with automatic token management. The returned user data — `id`, `userPrincipalName`, `displayName`, `mail`, `officeLocation`, `department`, `jobTitle`, `employeeId` — drives the OU mapping logic on the Google side.
+Authentication uses MSAL's OAuth 2.0 client credentials flow with automatic token management. The returned user data — `id`, `userPrincipalName`, `displayName`, `mail`, `officeLocation`, `department`, `jobTitle`, `employeeId`, plus `companyName`, `city` and `country`, and any other attribute used as a key in `ou_mapping` — drives the OU mapping logic on the Google side.
 
 **Tech Stack:** OAuth 2.0, Service Accounts, Domain-Wide Delegation
 

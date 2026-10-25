@@ -405,9 +405,10 @@ def sync_entra_to_google_ou(
         'skipped' and 'unmapped' and 'unchanged' contain email lists; 'failed' contains error
         details. Each Entra user with a userPrincipalName lands in exactly one bucket: 'unmapped'
         users exist in Google but match no ou_mapping rule, 'unchanged' users are already in
-        their target OU (logged as a WARNING, event ou_sync_unmapped, because it means the filter and mapping disagree). 'skipped' holds only users Google reports as
-        not found (HTTP 404); any other lookup error (403, 429 after retries, 5xx, network) is
-        recorded in 'failed' with target_ou None, since the user's state is unknown.
+        their target OU. 'skipped' holds only users Google reports as not found (HTTP 404); any
+        other lookup error (403, 429 after retries, 5xx, network) is recorded in 'failed' with
+        target_ou None, since the user's state is unknown. A non-empty 'unmapped' means the filter
+        and mapping disagree and is logged as a WARNING (event ou_sync_unmapped).
     """
     empty_result = {'synced': [], 'skipped': [], 'failed': [], 'unmapped': [], 'unchanged': [], 'would_sync': []}
 
@@ -427,7 +428,8 @@ def sync_entra_to_google_ou(
         tenant_id=entra_tenant_id,
         client_id=entra_client_id,
         client_secret=entra_client_secret,
-        filter_criteria=filter_criteria
+        filter_criteria=filter_criteria,
+        extra_select=list(ou_mapping)  # the mapped attributes must come back, whatever the filter
     )
 
     if not entra_users:

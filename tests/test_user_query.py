@@ -32,3 +32,14 @@ def test_filter_is_sent_as_param_not_interpolated():
     assert first.kwargs["headers"]["ConsistencyLevel"] == "eventual"
     assert second.args[0] == next_link
     assert second.kwargs["params"] is None
+
+
+def test_select_covers_every_filterable_attribute_and_extras_without_duplicates():
+    with mock.patch.object(m, "_get_graph_headers", return_value={}), \
+         mock.patch.object(m.requests, "get", return_value=_resp({"value": []})) as get:
+        m.get_entra_users_with_changes("t", "c", "s", filter_criteria="x eq 'y'",
+                                       extra_select=["state", "city"])
+    fields = get.call_args.kwargs["params"]["$select"].split(",")
+    assert set(m.FILTERABLE_USER_ATTRIBUTES) <= set(fields)
+    assert {"id", "userPrincipalName", "state"} <= set(fields)
+    assert len(fields) == len(set(fields))

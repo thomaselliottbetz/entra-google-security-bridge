@@ -536,6 +536,17 @@ FILTERABLE_USER_ATTRIBUTES = frozenset({
 })
 
 
+def _user_select_fields(extra_select=None):
+    """Default user properties, then every filterable attribute, then extras, without duplicates."""
+    base = ["id", "userPrincipalName", "displayName", "mail", "officeLocation", "department",
+            "jobTitle", "employeeId"]
+    fields = list(base)
+    for name in [*sorted(FILTERABLE_USER_ATTRIBUTES), *(extra_select or [])]:
+        if name not in fields:
+            fields.append(name)
+    return fields
+
+
 def build_user_filter(attribute, value):
     """
     Builds an OData $filter for get_entra_users_with_changes from an attribute and value.
@@ -583,7 +594,7 @@ def build_user_filter(attribute, value):
     return " or ".join(clauses)
 
 
-def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_criteria=None):
+def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_criteria=None, extra_select=None):
     """
     Queries Entra ID for users matching filter criteria.
 
@@ -598,10 +609,13 @@ def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_cri
                          a URL-encoded query parameter, so characters such as & and # are safe at
                          the URL level. The expression itself is passed to Graph as written, so
                          build it with build_user_filter when any part comes from untrusted input.
+        extra_select: Additional user properties to return, for attributes outside the default set.
 
     Returns:
         List of user dictionaries with id, userPrincipalName, displayName, mail, officeLocation,
-        department, jobTitle, employeeId.
+        department, jobTitle, employeeId, plus every other attribute build_user_filter accepts
+        (companyName, city, country) and anything in extra_select, so an attribute that can be
+        filtered on is also returned.
     """
     try:
         headers = _get_graph_headers(tenant_id, client_id, client_secret)
@@ -615,7 +629,7 @@ def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_cri
     graph_url = "https://graph.microsoft.com/v1.0/users"
     params = {
         "$filter": filter_criteria,
-        "$select": "id,userPrincipalName,displayName,mail,officeLocation,department,jobTitle,employeeId",
+        "$select": ",".join(_user_select_fields(extra_select)),
         # Microsoft documents eq on officeLocation and companyName as supported only with
         # advanced query parameters; they are harmless on properties that work without them.
         "$count": "true",

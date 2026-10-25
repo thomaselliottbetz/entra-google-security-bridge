@@ -273,3 +273,33 @@ def test_unmapped_and_skipped_users_log_warnings(caplog):
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert any(getattr(r, "event", "") == "ou_sync_unmapped" and r.count == 1 for r in warnings)
     assert any("not found in Google Workspace" in r.getMessage() for r in warnings)
+
+
+def _graph_honoring_select(users):
+    """Fake requests.get that, like Graph, returns only the properties named in $select."""
+    def get(url, headers=None, params=None, timeout=None):
+        wanted = set(params["$select"].split(","))
+        resp = mock.Mock(status_code=200)
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"value": [{k: v for k, v in u.items() if k in wanted} for u in users]}
+        return resp
+    return get
+
+
+@pytest.mark.parametrize("attribute", ["city", "companyName", "country", "state"])
+def test_mapping_on_any_attribute_reaches_the_mapping_end_to_end(attribute):
+    """state is not filterable, so it only arrives through extra_select (custom filter case)."""
+    import identity_governance_ms as ms
+    users = [{"id": "1", "userPrincipalName": "a@example.com", attribute: "Berlin"}]
+    svc = mock.MagicMock()
+    svc.users().get().execute.return_value = {"orgUnitPath": "/Sales"}
+    with mock.patch.object(ms, "_get_graph_headers", return_value={}), \
+         mock.patch.object(ms.requests, "get", side_effect=_graph_honoring_select(users)), \
+         mock.patch.object(g.service_account.Credentials, "from_service_account_file"), \
+         mock.patch.object(g, "_get_admin_email", return_value="admin@example.com"), \
+         mock.patch.object(g, "build", return_value=svc):
+        result = g.sync_entra_to_google_ou(
+            "t", "c", "s", "creds.json", ou_mapping={attribute: {"Berlin": "/EU/Berlin"}},
+            filter_criteria=f"{attribute} eq 'Berlin'", dry_run=True)
+    assert result["unmapped"] == []
+    assert [x["target_ou"] for x in result["would_sync"]] == ["/EU/Berlin"]
