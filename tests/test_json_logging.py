@@ -30,7 +30,7 @@ def test_json_formatter_serializes_unknown_types():
 
 
 def _run(fmt):
-    code = ("import logging, identity_governance_ms as m;"
+    code = ("import logging, identity_governance_ms as m; m.configure_logging();"
             "logging.getLogger('x').warning('hello', extra={'event': 'e'})")
     env = {**os.environ, "PYTHONPATH": ROOT}
     env.pop("BRIDGE_LOG_FORMAT", None)
@@ -59,7 +59,7 @@ def test_finding_logs_carry_events(caplog):
 
 
 def _capture(fmt, fn):
-    """Runs fn() under a handler configured like _configure_logging for the given mode."""
+    """Runs fn() under a handler configured like configure_logging for the given mode."""
     import io
     buf = io.StringIO()
     h = logging.StreamHandler(buf)
@@ -153,7 +153,8 @@ def test_summary_event_emitted_when_nothing_is_found(caplog):
     with mock.patch.object(g, "get_entra_users_with_changes", return_value=[]), caplog.at_level("INFO"):
         g.sync_entra_to_google_ou("t", "c", "s", "creds.json")
     s = events()["ou_sync_summary"]
-    assert (s.synced, s.skipped, s.failed) == (0, 0, 0)
+    assert (s.synced, s.skipped, s.failed, s.unmapped, s.unchanged, s.would_sync) == (0, 0, 0, 0, 0, 0)
+    assert s.dry_run is False
 
     caplog.clear()
     svc = mock.MagicMock()
@@ -163,3 +164,26 @@ def test_summary_event_emitted_when_nothing_is_found(caplog):
          mock.patch.object(g, "build", return_value=svc), caplog.at_level("INFO"):
         g.audit_oauth_tokens("creds.json")
     assert events()["oauth_audit_summary"].users_total == 0
+
+
+def test_importing_the_modules_does_not_configure_root_logging():
+    code = ("import logging, identity_governance_ms, collaboration_security_google;"
+            "print(len(logging.getLogger().handlers))")
+    out = subprocess.run([sys.executable, "-c", code], env={**os.environ, "PYTHONPATH": ROOT},
+                         capture_output=True, text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "0"
+
+
+def test_configure_logging_installs_a_handler_only_on_an_unconfigured_root():
+    root = logging.getLogger()
+    saved, level = root.handlers[:], root.level
+    try:
+        root.handlers[:] = []
+        m.configure_logging()
+        assert len(root.handlers) == 1
+        m.configure_logging()
+        assert len(root.handlers) == 1  # already configured: no second handler
+    finally:
+        root.handlers[:] = saved
+        root.setLevel(level)

@@ -50,12 +50,15 @@ class ModeFilter(logging.Filter):
         return not getattr(record, self._drop_attr, False)
 
 
-def _configure_logging():
+def configure_logging():
     """
     Configures root logging: plain text by default, JSON lines when BRIDGE_LOG_FORMAT=json.
 
-    Like logging.basicConfig, this does nothing if the host application has already
-    configured logging, so an application's own setup always takes precedence. Applications
+    Nothing calls this on import; a script using these modules calls it once at startup
+    (bridge_cli.py does). Like logging.basicConfig, it does nothing if the root logger already
+    has handlers, so an application's own setup always takes precedence. Without any logging
+    configuration, Python's last-resort handler still prints WARNING and above, which includes
+    every security finding, but not INFO status or summary lines. Applications
     using their own handlers should attach the matching ModeFilter as well as, for JSON,
     JsonFormatter: ModeFilter("text_only") on a JSON handler, ModeFilter("json_only") on a
     text handler. Without the filter, a JSON handler also receives text-only lines such as
@@ -71,7 +74,6 @@ def _configure_logging():
     logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 
-_configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -358,8 +360,8 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
     otherwise the later of the interactive and non-interactive attempts). Guests with no sign-in on record count as inactive only once their
     createdDateTime falls outside the inactivity window.
 
-    Note: Requires User.Read.All (or Directory.Read.All) plus AuditLog.Read.All application
-    permissions with admin consent. signInActivity requires an Entra ID P1/P2 license.
+    Note: Requires User.Read.All plus AuditLog.Read.All application permissions with admin
+    consent (Directory.Read.All is not needed). signInActivity requires an Entra ID P1/P2 license.
     """
     empty_result = {
         "trusted_active": [],
@@ -527,6 +529,60 @@ def audit_guest_users(tenant_id, client_id, client_secret, trusted_domains=None,
         return empty_result
 
 
+# User attributes build_user_filter accepts; anything else is rejected rather than interpolated.
+FILTERABLE_USER_ATTRIBUTES = frozenset({
+    "officeLocation", "department", "jobTitle", "employeeId", "companyName",
+    "city", "country", "displayName", "mail", "userPrincipalName",
+})
+
+
+def build_user_filter(attribute, value):
+    """
+    Builds an OData $filter for get_entra_users_with_changes from an attribute and value.
+
+    Use this when the value comes from outside the code (config, a ticket, user input), so it
+    cannot alter the shape of the expression.
+
+    Args:
+        attribute: A name in FILTERABLE_USER_ATTRIBUTES (exact, case-sensitive match).
+        value: A non-empty string, or a list/tuple/set of them to match any one
+               ("attr eq 'a' or attr eq 'b'"). Single quotes are doubled per OData rules;
+               control characters are rejected.
+
+    Returns:
+        A filter string, e.g. "officeLocation eq 'Seattle'".
+
+    Raises:
+        ValueError: If the attribute is not allowed or a value is empty, not a string, or
+        contains control characters.
+    """
+    if attribute not in FILTERABLE_USER_ATTRIBUTES:
+        raise ValueError(
+            f"Unsupported filter attribute {attribute!r}; allowed: {sorted(FILTERABLE_USER_ATTRIBUTES)}"
+        )
+
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (set, frozenset)):
+        values = sorted(value, key=str)
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        values = []
+    if not values:
+        raise ValueError("value must be a non-empty string or a non-empty list of strings")
+
+    clauses = []
+    for v in values:
+        if not isinstance(v, str) or not v:
+            raise ValueError(f"Filter values must be non-empty strings, got {v!r}")
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in v):
+            raise ValueError(f"Filter value contains control characters: {v!r}")
+        escaped = v.replace("'", "''")
+        clauses.append(f"{attribute} eq '{escaped}'")
+    return " or ".join(clauses)
+
+
 def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_criteria=None):
     """
     Queries Entra ID for users matching filter criteria.
@@ -538,7 +594,10 @@ def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_cri
         tenant_id: Entra ID tenant ID
         client_id: App registration client ID
         client_secret: App registration client secret
-        filter_criteria: OData filter expression (default: "officeLocation eq 'Seattle'")
+        filter_criteria: OData filter expression (default: "officeLocation eq 'Seattle'"). Sent as
+                         a URL-encoded query parameter, so characters such as & and # are safe at
+                         the URL level. The expression itself is passed to Graph as written, so
+                         build it with build_user_filter when any part comes from untrusted input.
 
     Returns:
         List of user dictionaries with id, userPrincipalName, displayName, mail, officeLocation,
@@ -553,15 +612,19 @@ def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_cri
     if filter_criteria is None:
         filter_criteria = "officeLocation eq 'Seattle'"
 
-    select_fields = "id,userPrincipalName,displayName,mail,officeLocation,department,jobTitle,employeeId"
-    query_url = f"https://graph.microsoft.com/v1.0/users?$filter={filter_criteria}&$select={select_fields}"
+    graph_url = "https://graph.microsoft.com/v1.0/users"
+    params = {
+        "$filter": filter_criteria,
+        "$select": "id,userPrincipalName,displayName,mail,officeLocation,department,jobTitle,employeeId"
+    }
 
     try:
         all_users = []
-        page_url = query_url
+        page_url = graph_url
 
         while page_url:
-            response = _graph_get(page_url, headers)
+            response = _graph_get(page_url, headers, params=params)
+            params = None  # nextLink already carries the full query
             response.raise_for_status()
             data = response.json()
             page_users = data.get('value', [])

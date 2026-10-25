@@ -3,9 +3,28 @@ import os
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from identity_governance_ms import get_entra_users_with_changes  # also configures logging
+from googleapiclient.errors import HttpError
+from identity_governance_ms import get_entra_users_with_changes
 
 logger = logging.getLogger(__name__)
+
+
+# Retries the Google client applies to each call on 429 and 5xx responses. OU updates set an
+# absolute value, so repeating one is safe.
+_API_RETRIES = 3
+
+# Scopes that grant broad access to mail, files, or cloud resources. audit_oauth_tokens flags
+# a token holding any of these unless its client ID is approved. A blocked_scopes argument
+# replaces this list; extend it with [*DEFAULT_BLOCKED_SCOPES, ...] to keep the defaults.
+DEFAULT_BLOCKED_SCOPES = (
+    'https://mail.google.com/',  # full Gmail access: read, send, delete, IMAP/SMTP
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/cloud-platform',
+)
 
 
 def _get_admin_email():
@@ -24,7 +43,7 @@ def _get_admin_email():
     return admin_email
 
 
-def move_user_to_ou(user_email, target_ou_path, credentials_path):
+def move_user_to_ou(user_email, target_ou_path, credentials_path, dry_run=False):
     """
     Moves a user to a different organizational unit in Google Workspace.
 
@@ -35,6 +54,8 @@ def move_user_to_ou(user_email, target_ou_path, credentials_path):
         user_email: User's primary email address
         target_ou_path: Target organizational unit path (e.g., "/Engineering/Seattle")
         credentials_path: Path to service account JSON key file
+        dry_run: If True, log the move that would be made and change nothing. No API call is
+                 made, so the user's existence and the OU path are not checked.
     """
     scopes = ['https://www.googleapis.com/auth/admin.directory.user']
     credentials = service_account.Credentials.from_service_account_file(
@@ -43,26 +64,36 @@ def move_user_to_ou(user_email, target_ou_path, credentials_path):
     delegated_credentials = credentials.with_subject(_get_admin_email())
     service = build('admin', 'directory_v1', credentials=delegated_credentials)
 
+    if dry_run:
+        logger.info(f"[DRY RUN] Would move {user_email} to {target_ou_path}")
+        return
+
     try:
-        service.users().update(userKey=user_email, body={"orgUnitPath": target_ou_path}).execute()
+        service.users().update(userKey=user_email, body={"orgUnitPath": target_ou_path}).execute(num_retries=_API_RETRIES)
         logger.info(f"User {user_email} moved to {target_ou_path}")
     except Exception as e:
         logger.error(f"Error moving user: {e}")
         raise
 
 
-def move_user_between_ous(user_email, source_org_unit_path, target_org_unit_path, credentials_path):
+def move_user_between_ous(user_email, source_org_unit_path, target_org_unit_path, credentials_path, dry_run=False):
     """
     Moves a user between organizational units in Google Workspace with pre-flight verification.
 
-    Verifies the user's current OU matches the expected source OU before moving to target OU.
-    Logs a warning if current OU differs from expected source.
+    Reads the user's current OU and moves them only if it matches the expected source OU.
+    On a mismatch nothing is changed and ValueError is raised. The read and the update are
+    separate API calls, so this narrows the window for a stale move but is not atomic.
 
     Args:
         user_email: User's primary email address
         source_org_unit_path: Expected current OU path (for verification)
         target_org_unit_path: Target OU path
         credentials_path: Path to service account JSON key file
+        dry_run: If True, perform the read and the source check but skip the update. A source
+                 mismatch still raises, so a dry run shows what a real run would refuse.
+
+    Raises:
+        ValueError: If the user's current OU differs from source_org_unit_path.
 
     Note: Requires service account with domain-wide delegation and GOOGLE_ADMIN_EMAIL environment variable.
     """
@@ -74,12 +105,18 @@ def move_user_between_ous(user_email, source_org_unit_path, target_org_unit_path
     service = build('admin', 'directory_v1', credentials=delegated_credentials)
 
     try:
-        user = service.users().get(userKey=user_email).execute()
+        user = service.users().get(userKey=user_email).execute(num_retries=_API_RETRIES)
         current_ou = user.get('orgUnitPath', '')
         if current_ou != source_org_unit_path:
-            logger.warning(f"User OU is '{current_ou}', not expected '{source_org_unit_path}'. Proceeding.")
+            raise ValueError(
+                f"User {user_email} is in '{current_ou}', not expected '{source_org_unit_path}'; not moved."
+            )
 
-        service.users().update(userKey=user_email, body={"orgUnitPath": target_org_unit_path}).execute()
+        if dry_run:
+            logger.info(f"[DRY RUN] Would move {user_email} from {current_ou} to {target_org_unit_path}")
+            return
+
+        service.users().update(userKey=user_email, body={"orgUnitPath": target_org_unit_path}).execute(num_retries=_API_RETRIES)
         logger.info(f"User {user_email} moved to {target_org_unit_path}.")
     except Exception as e:
         logger.error(f"Error moving user: {e}")
@@ -96,8 +133,9 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
 
     Args:
         credentials_path: Path to service account JSON key file
-        blocked_scopes: List of OAuth scope URIs considered high-risk
-                        (default: common drive and gmail scopes)
+        blocked_scopes: List of OAuth scope URIs considered high-risk (default:
+                        DEFAULT_BLOCKED_SCOPES: full and partial Gmail access, Drive, and
+                        cloud-platform). Replaces the defaults rather than extending them.
         approved_apps: OAuth client IDs of approved applications (default: none). Accepts any
                        iterable of client IDs, or a dict of {client_id: label}. Matching is an
                        exact, case-insensitive comparison on client ID only; display names are
@@ -106,12 +144,20 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
     Returns:
         Dictionary with keys 'high_risk', 'medium_risk', 'low_risk', 'errors'. The risk keys
         contain lists of token dictionaries with user, app_name, client_id, scopes, and
-        anonymous fields. 'errors' lists users whose tokens could not be retrieved
-        (user, error), i.e. coverage gaps in the audit.
+        anonymous fields. 'anonymous' is informational: it reports that the app has an
+        anonymous client ID (not registered with Google) and does not change the risk tier,
+        which depends only on scopes and the approved list. 'errors' lists users whose tokens could not be retrieved
+        (user, error), i.e. coverage gaps in the audit. If the audit fails as a whole (for
+        example, listing users), the four keys are still returned, empty except for a single
+        'errors' entry with user None, and no summary event is emitted; an empty result with
+        no errors is a genuinely clean audit. Credential and GOOGLE_ADMIN_EMAIL problems raise
+        instead of returning.
 
     Note: Requires service account with domain-wide delegation and GOOGLE_ADMIN_EMAIL environment
-    variable. admin.directory.user.security scope requires explicit approval in Google Workspace
-    admin console.
+    variable. Each scope used here must be authorized for the service account's client ID in the
+    Google Workspace admin console (domain-wide delegation). admin.directory.user.security is
+    the most sensitive of them: it covers application-specific password, OAuth token, and
+    verification code operations, not only token listing.
     """
     admin_scopes = [
         'https://www.googleapis.com/auth/admin.directory.user.readonly',
@@ -124,12 +170,7 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
     service = build('admin', 'directory_v1', credentials=delegated_credentials)
 
     if blocked_scopes is None:
-        blocked_scopes = [
-            'https://www.googleapis.com/auth/drive.readonly',
-            'https://www.googleapis.com/auth/drive',
-            'https://www.googleapis.com/auth/gmail.readonly',
-            'https://www.googleapis.com/auth/gmail.send'
-        ]
+        blocked_scopes = DEFAULT_BLOCKED_SCOPES
     blocked_scopes = set(blocked_scopes)
 
     approved_client_ids = {str(c).lower() for c in (approved_apps or [])}
@@ -142,7 +183,7 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
             kwargs = {'customer': 'my_customer', 'maxResults': 500}
             if page_token:
                 kwargs['pageToken'] = page_token
-            users_result = service.users().list(**kwargs).execute(num_retries=3)
+            users_result = service.users().list(**kwargs).execute(num_retries=_API_RETRIES)
             users.extend(users_result.get('users', []))
             page_token = users_result.get('nextPageToken')
             if not page_token:
@@ -161,7 +202,7 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
                 continue
 
             try:
-                tokens_result = service.tokens().list(userKey=user_email).execute(num_retries=3)
+                tokens_result = service.tokens().list(userKey=user_email).execute(num_retries=_API_RETRIES)
                 tokens = tokens_result.get('items', [])
 
                 for token in tokens:
@@ -268,8 +309,16 @@ def audit_oauth_tokens(credentials_path, blocked_scopes=None, approved_apps=None
         }
 
     except Exception as e:
-        logger.error(f"Error auditing OAuth tokens: {e}")
-        return {}
+        logger.error(
+            f"Error auditing OAuth tokens: {e}",
+            extra={"event": "oauth_audit_failed", "error": str(e)},
+        )
+        return {
+            'high_risk': [],
+            'medium_risk': [],
+            'low_risk': [],
+            'errors': [{'user': None, 'error': str(e)}]
+        }
 
 
 def sync_entra_to_google_ou(
@@ -279,7 +328,8 @@ def sync_entra_to_google_ou(
     google_credentials_path,
     ou_mapping=None,
     filter_criteria=None,
-    email_domain_mapping=None
+    email_domain_mapping=None,
+    dry_run=False
 ):
     """
     Syncs organizational unit placement from Entra ID to Google Workspace.
@@ -299,13 +349,21 @@ def sync_entra_to_google_ou(
         filter_criteria: OData filter for Entra ID query (optional)
         email_domain_mapping: Optional dict mapping Entra email domains to Google domains,
                              e.g., {"@company.com": "@company.google.com"}
+        dry_run: If True, look users up and work out every move but change nothing. Moves that
+                 would be made are reported under 'would_sync' instead of 'synced'.
 
     Returns:
-        Dictionary with keys 'synced', 'skipped', 'failed'. 'synced' contains dictionaries with
-        email, source_attr, source_value, target_ou, previous_ou. 'skipped' and 'failed' contain
-        email lists and error details respectively.
+        Dictionary with keys 'synced', 'skipped', 'failed', 'unmapped', 'unchanged',
+        'would_sync'. 'synced' and 'would_sync' (dry run only; empty otherwise) contain
+        dictionaries with email, source_attr, source_value, target_ou, previous_ou.
+        'skipped' and 'unmapped' and 'unchanged' contain email lists; 'failed' contains error
+        details. Each Entra user with a userPrincipalName lands in exactly one bucket: 'unmapped'
+        users exist in Google but match no ou_mapping rule, 'unchanged' users are already in
+        their target OU. 'skipped' holds only users Google reports as
+        not found (HTTP 404); any other lookup error (403, 429 after retries, 5xx, network) is
+        recorded in 'failed' with target_ou None, since the user's state is unknown.
     """
-    empty_result = {'synced': [], 'skipped': [], 'failed': []}
+    empty_result = {'synced': [], 'skipped': [], 'failed': [], 'unmapped': [], 'unchanged': [], 'would_sync': []}
 
     if ou_mapping is None:
         ou_mapping = {
@@ -325,7 +383,10 @@ def sync_entra_to_google_ou(
     if not entra_users:
         logger.info(
             "No users found in Entra ID matching criteria",
-            extra={"event": "ou_sync_summary", "synced": 0, "skipped": 0, "failed": 0},
+            extra={
+                "event": "ou_sync_summary", "synced": 0, "skipped": 0, "failed": 0,
+                "unmapped": 0, "unchanged": 0, "would_sync": 0, "dry_run": dry_run,
+            },
         )
         return empty_result
 
@@ -339,6 +400,9 @@ def sync_entra_to_google_ou(
     synced_users = []
     skipped_users = []
     failed_users = []
+    unmapped_users = []
+    unchanged_users = []
+    would_sync_users = []
 
     logger.info(f"Processing {len(entra_users)} users from Entra ID for OU sync")
 
@@ -356,11 +420,25 @@ def sync_entra_to_google_ou(
                     break
 
         try:
-            google_user = service.users().get(userKey=google_email).execute()
+            google_user = service.users().get(userKey=google_email).execute(num_retries=_API_RETRIES)
             current_ou = google_user.get('orgUnitPath', '/')
+        except HttpError as e:
+            if e.resp.status == 404:
+                logger.debug(f"User {google_email} not found in Google Workspace, skipping: {e}")
+                skipped_users.append(google_email)
+            else:
+                logger.error(
+                    f"Could not look up {google_email} in Google Workspace: {e}",
+                    extra={"event": "ou_sync_failed", "user": google_email, "target_ou": None, "error": str(e)},
+                )
+                failed_users.append({'email': google_email, 'target_ou': None, 'error': str(e)})
+            continue
         except Exception as e:
-            logger.debug(f"User {google_email} not found in Google Workspace, skipping: {e}")
-            skipped_users.append(google_email)
+            logger.error(
+                f"Could not look up {google_email} in Google Workspace: {e}",
+                extra={"event": "ou_sync_failed", "user": google_email, "target_ou": None, "error": str(e)},
+            )
+            failed_users.append({'email': google_email, 'target_ou': None, 'error': str(e)})
             continue
 
         target_ou = None
@@ -377,14 +455,34 @@ def sync_entra_to_google_ou(
 
         if not target_ou:
             logger.debug(f"No OU mapping found for {email} (attributes: {user})")
+            unmapped_users.append(google_email)
             continue
 
         if current_ou == target_ou:
             logger.debug(f"User {email} already in target OU {target_ou}, skipping")
+            unchanged_users.append(google_email)
+            continue
+
+        move = {
+            'email': google_email,
+            'source_attr': matched_attr,
+            'source_value': matched_value,
+            'target_ou': target_ou,
+            'previous_ou': current_ou
+        }
+
+        if dry_run:
+            would_sync_users.append(move)
+            logger.info(
+                f"[DRY RUN] Would sync {google_email} from {current_ou} to {target_ou} "
+                f"(matched on {matched_attr}={matched_value})",
+                extra={"event": "ou_sync_would_move", "user": google_email, "source_attr": matched_attr,
+                       "source_value": matched_value, "target_ou": target_ou, "previous_ou": current_ou},
+            )
             continue
 
         try:
-            service.users().update(userKey=google_email, body={"orgUnitPath": target_ou}).execute()
+            service.users().update(userKey=google_email, body={"orgUnitPath": target_ou}).execute(num_retries=_API_RETRIES)
             synced_users.append({
                 'email': google_email,
                 'source_attr': matched_attr,
@@ -401,13 +499,18 @@ def sync_entra_to_google_ou(
             failed_users.append({'email': google_email, 'target_ou': target_ou, 'error': str(e)})
 
     logger.info(
-        f"Sync complete: {len(synced_users)} synced, {len(skipped_users)} skipped "
-        f"(not in Google), {len(failed_users)} failed",
+        f"{'[DRY RUN] ' if dry_run else ''}Sync complete: {len(synced_users)} synced, "
+        f"{len(would_sync_users)} would sync, {len(skipped_users)} skipped (not in Google), "
+        f"{len(failed_users)} failed, {len(unmapped_users)} unmapped, {len(unchanged_users)} unchanged",
         extra={
             "event": "ou_sync_summary",
             "synced": len(synced_users),
             "skipped": len(skipped_users),
             "failed": len(failed_users),
+            "unmapped": len(unmapped_users),
+            "unchanged": len(unchanged_users),
+            "would_sync": len(would_sync_users),
+            "dry_run": dry_run,
         },
     )
 
@@ -422,5 +525,8 @@ def sync_entra_to_google_ou(
     return {
         'synced': synced_users,
         'skipped': skipped_users,
-        'failed': failed_users
+        'failed': failed_users,
+        'unmapped': unmapped_users,
+        'unchanged': unchanged_users,
+        'would_sync': would_sync_users
     }
