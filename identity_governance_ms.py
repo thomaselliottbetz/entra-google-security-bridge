@@ -615,13 +615,15 @@ def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_cri
         List of user dictionaries with id, userPrincipalName, displayName, mail, officeLocation,
         department, jobTitle, employeeId, plus every other attribute build_user_filter accepts
         (companyName, city, country) and anything in extra_select, so an attribute that can be
-        filtered on is also returned.
+        filtered on is also returned. An empty list means no user matched. None means the query
+        failed (authentication or API error, already logged at ERROR); unlike the other Entra
+        functions, this one does not return [] for a failure, so a caller can tell the two apart.
     """
     try:
         headers = _get_graph_headers(tenant_id, client_id, client_secret)
     except RuntimeError as e:
         logger.error(str(e))
-        return []
+        return None
 
     if filter_criteria is None:
         filter_criteria = "officeLocation eq 'Seattle'"
@@ -668,4 +670,4 @@ def get_entra_users_with_changes(tenant_id, client_id, client_secret, filter_cri
         logger.error(f"Error querying Entra ID users: {e}")
         if e.response is not None:
             logger.error(f"Response: {e.response.text}")
-        return []
+        return None

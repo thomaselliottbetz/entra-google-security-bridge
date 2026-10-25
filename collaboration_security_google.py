@@ -432,6 +432,11 @@ def sync_entra_to_google_ou(
         extra_select=list(ou_mapping)  # the mapped attributes must come back, whatever the filter
     )
 
+    if entra_users is None:
+        # The Entra query failed and already logged an ERROR. Emit no summary: a zero summary
+        # would let a "summary arrived" alert read a failed run as a clean one.
+        return empty_result
+
     if not entra_users:
         logger.info(
             "No users found in Entra ID matching criteria",

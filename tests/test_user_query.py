@@ -43,3 +43,19 @@ def test_select_covers_every_filterable_attribute_and_extras_without_duplicates(
     assert set(m.FILTERABLE_USER_ATTRIBUTES) <= set(fields)
     assert {"id", "userPrincipalName", "state"} <= set(fields)
     assert len(fields) == len(set(fields))
+
+
+def test_failures_return_none_not_an_empty_list(caplog):
+    import requests
+    with mock.patch.object(m, "_get_graph_headers", side_effect=RuntimeError("auth failed")):
+        assert m.get_entra_users_with_changes("t", "c", "s") is None
+
+    bad = mock.Mock(status_code=400)
+    bad.raise_for_status.side_effect = requests.exceptions.HTTPError("400", response=mock.Mock(text="bad"))
+    with mock.patch.object(m, "_get_graph_headers", return_value={}), \
+         mock.patch.object(m.requests, "get", return_value=bad):
+        assert m.get_entra_users_with_changes("t", "c", "s") is None
+
+    with mock.patch.object(m, "_get_graph_headers", return_value={}), \
+         mock.patch.object(m.requests, "get", return_value=_resp({"value": []})):
+        assert m.get_entra_users_with_changes("t", "c", "s") == []

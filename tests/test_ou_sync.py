@@ -303,3 +303,18 @@ def test_mapping_on_any_attribute_reaches_the_mapping_end_to_end(attribute):
             filter_criteria=f"{attribute} eq 'Berlin'", dry_run=True)
     assert result["unmapped"] == []
     assert [x["target_ou"] for x in result["would_sync"]] == ["/EU/Berlin"]
+
+
+def test_failed_entra_query_emits_no_summary_but_empty_matches_do(caplog):
+    with mock.patch.object(g, "get_entra_users_with_changes", return_value=None), \
+         mock.patch.object(g, "build") as build, caplog.at_level("INFO"):
+        failed = g.sync_entra_to_google_ou("t", "c", "s", "creds.json")
+    assert failed == {"synced": [], "skipped": [], "failed": [], "unmapped": [], "unchanged": [], "would_sync": []}
+    assert "ou_sync_summary" not in [getattr(r, "event", None) for r in caplog.records]
+    build.assert_not_called()
+
+    caplog.clear()
+    with mock.patch.object(g, "get_entra_users_with_changes", return_value=[]), \
+         caplog.at_level("INFO"):
+        g.sync_entra_to_google_ou("t", "c", "s", "creds.json")
+    assert "ou_sync_summary" in [getattr(r, "event", None) for r in caplog.records]

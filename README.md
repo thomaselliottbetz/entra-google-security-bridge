@@ -269,6 +269,7 @@ print(f"High-risk tokens found: {len(token_report.get('high_risk', []))}")
 ```python
 from identity_governance_ms import get_entra_users_with_changes
 
+# Returns a list (empty when no user matches), or None if the query failed
 users_needing_sync = get_entra_users_with_changes(
     tenant_id="your-tenant-id",
     client_id="your-app-client-id",
@@ -357,7 +358,7 @@ All output uses Python's `logging` module with consistent levels: `INFO` for sta
 BRIDGE_LOG_FORMAT=json python bridge_cli.py guest-audit 2>> bridge.jsonl   # or your own script that calls configure_logging()
 ```
 
-Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `message`. Each finding additionally carries a stable `event` key and event-specific fields; other status lines do not, so detection rules should filter on `event`. JSON output is complete: every medium-risk OAuth token is emitted as its own event, whereas text output shows only the first 10 followed by a count. Each audit run that completes also emits one `*_summary` event, including when it finds nothing, so a dashboard or alert can detect that a scheduled job has stopped running. A run that fails (for example, on authentication or an API error) logs an `ERROR` and emits no summary, so alert on a missing summary or on `ERROR` records. For example, for a job scheduled hourly, alert when no `risk_detection_summary` arrives within two hours; choose the threshold to fit each job's schedule:
+Every record carries `timestamp` (UTC, ISO 8601), `level`, `logger`, and `message`. Each finding additionally carries a stable `event` key and event-specific fields; other status lines do not, so detection rules should filter on `event`. JSON output is complete: every medium-risk OAuth token is emitted as its own event, whereas text output shows only the first 10 followed by a count. Each audit run that completes also emits one `*_summary` event, including when it finds nothing, so a dashboard or alert can detect that a scheduled job has stopped running. A run that fails (for example, on authentication or an API error, including a failed Entra query inside `sync_entra_to_google_ou`) logs an `ERROR` and emits no summary, so alert on a missing summary or on `ERROR` records. For example, for a job scheduled hourly, alert when no `risk_detection_summary` arrives within two hours; choose the threshold to fit each job's schedule:
 
 | `event` | Fields |
 |---|---|
